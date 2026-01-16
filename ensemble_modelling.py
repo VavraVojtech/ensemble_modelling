@@ -11,7 +11,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.linear_model import ElasticNet
 from sklearn.svm import SVR
 from sklearn.neighbors import KNeighborsRegressor
-from sklearn.ensemble import ExtraTreesRegressor  # NOVÉ
+from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.compose import TransformedTargetRegressor
 from scipy.optimize import nnls, minimize
 import joblib
@@ -38,6 +38,13 @@ except ImportError:
     print("Warning: Prophet not installed.")
 
 try:
+    from neuralprophet import NeuralProphet
+    NEURALPROPHET_AVAILABLE = True
+except ImportError:
+    NEURALPROPHET_AVAILABLE = False
+    print("Warning: NeuralProphet not installed.")
+
+try:
     from statsmodels.tsa.statespace.sarimax import SARIMAX
     SARIMAX_AVAILABLE = True
 except ImportError:
@@ -47,7 +54,7 @@ except ImportError:
 try:
     os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "gloo"
     import pytorch_lightning as pl
-    from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet, NHiTS # NOVÉ: NHiTS
+    from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet, NHiTS
     from pytorch_forecasting.data import GroupNormalizer
     from pytorch_forecasting.metrics import QuantileLoss
     TFT_AVAILABLE = True
@@ -58,6 +65,8 @@ except ImportError:
 warnings.filterwarnings('ignore')
 import logging
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+# Potlačení logů NeuralProphetu
+logging.getLogger("neuralprophet").setLevel(logging.ERROR)
 
 # ==========================================
 # 1. KONFIGURACE
@@ -151,12 +160,8 @@ def get_hyperopt_space(model_name):
         return {'C': hp.loguniform('C', np.log(0.1), np.log(100)), 'gamma': hp.choice('gamma', ['scale', 'auto', 0.1, 0.01])}
     elif model_name == 'KNN':
         return {'n_neighbors': hp.quniform('n', 3, 30, 1)}
-    elif model_name == 'ExtraTrees': # NOVÉ
-        return {
-            'n_estimators': hp.quniform('n_est', 100, 1000, 50),
-            'max_depth': hp.quniform('md', 5, 30, 1),
-            'min_samples_split': hp.quniform('min_samp', 2, 10, 1)
-        }
+    elif model_name == 'ExtraTrees':
+        return {'n_estimators': hp.quniform('n_est', 100, 1000, 50), 'max_depth': hp.quniform('md', 5, 30, 1), 'min_samples_split': hp.quniform('min_samp', 2, 10, 1)}
     return {}
 
 def optimize_model(model_name, X_train, y_train, X_val, y_val, evals=10):
@@ -172,7 +177,7 @@ def optimize_model(model_name, X_train, y_train, X_val, y_val, evals=10):
         elif model_name == 'SVR': 
             svr = SVR(**params)
             model = TransformedTargetRegressor(regressor=svr, transformer=StandardScaler())
-        elif model_name == 'ExtraTrees': # NOVÉ
+        elif model_name == 'ExtraTrees':
             model = ExtraTreesRegressor(**params, random_state=42, n_jobs=-1)
         
         model.fit(X_train, y_train)
@@ -227,7 +232,62 @@ def train_sarimax(y_train, X_train, X_val, X_test):
     full_preds = results.predict(start=start_idx, end=end_idx, exog=X_forecast)
     return full_preds
 
-# --- WRAPPERS PRO DEEP LEARNING (TFT & N-HiTS) ---
+# --- NEURAL PROPHET WRAPPER (NOVÉ) ---
+def run_neural_prophet(full_df, split_date, target_col):
+    if not NEURALPROPHET_AVAILABLE: return None
+    print("--- Training NeuralProphet ---")
+    
+    # 1. Prepare Data
+    df_np = full_df[['date', target_col, 'temperature_2m', 'temp_effective', 'is_working_day', 'wind_speed_10m']].copy()
+    df_np.rename(columns={'date': 'ds', target_col: 'y'}, inplace=True)
+    
+    # 2. Setup Model
+    # Používáme Lagged regressors (AR) + Future regressors
+    m = NeuralProphet(
+        n_lags=7, # Auto-regrese (posledních 7 dní)
+        n_forecasts=1,
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=False,
+        batch_size=64,
+        epochs=30,
+        learning_rate=0.01,
+        trainer_config={'accelerator': 'cpu'} # Force CPU pro stabilitu
+    )
+    
+    # Add regressors
+    for reg in ['temperature_2m', 'temp_effective', 'is_working_day', 'wind_speed_10m']:
+        m.add_future_regressor(reg)
+        
+    # 3. Fit
+    # NeuralProphet needs training set
+    train_df_np = df_np[df_np['ds'] < split_date]
+    m.fit(train_df_np, freq='D')
+    
+    # 4. Predict
+    # NeuralProphet potřebuje historii pro AR lags, takže mu předhodíme celý dataset
+    # On si sám dopočítá predikce tam, kde může
+    future = m.make_future_dataframe(df_np, periods=0, n_historic_predictions=True)
+    forecast = m.predict(future)
+    
+    # 5. Extract and align
+    # Forecast má sloupec 'yhat1'. Musíme ho napárovat zpět k full_df podle data.
+    forecast = forecast[['ds', 'yhat1']].rename(columns={'ds': 'date', 'yhat1': 'pred'})
+    
+    # Merge to align with original df indices
+    merged = pd.merge(full_df[['date']], forecast, on='date', how='left')
+    
+    # Filtrujeme jen valid/test část (od split_date)
+    result_slice = merged[merged['date'] >= split_date]['pred'].values
+    
+    # Fill NaN (start forecastu může chybět kvůli lagům)
+    if np.isnan(result_slice).any():
+        mask = np.isnan(result_slice)
+        result_slice[mask] = np.interp(np.flatnonzero(mask), np.flatnonzero(~mask), result_slice[~mask])
+        
+    return result_slice
+
+# --- DEEP LEARNING (TFT & N-HiTS) ---
 if TFT_AVAILABLE:
     class PLWrapper(pl.LightningModule):
         def __init__(self, model):
@@ -246,10 +306,8 @@ if TFT_AVAILABLE:
 
 def run_deep_model(full_df, split_date, target_col, model_type='TFT', max_epochs=30):
     if not TFT_AVAILABLE: return np.zeros(len(full_df[full_df['date'] >= split_date]))
-    print(f"--- Training {model_type} (Integrated Fix V3) ---")
+    print(f"--- Training {model_type} ---")
     data = full_df.copy()
-    
-    # 1. Log Transform & Scaler
     data['target_log'] = np.log1p(data[target_col])
     train_indices = data[data['date'] < split_date].index
     scaler = StandardScaler()
@@ -264,95 +322,64 @@ def run_deep_model(full_df, split_date, target_col, model_type='TFT', max_epochs
     cutoff_idx = data[data['date'] >= split_date].iloc[0]['time_idx']
     training_cutoff = cutoff_idx - 1
     
-    # --- MODEL SPECIFIC CONFIG ---
     max_encoder_length = 60
     if model_type == 'N-HiTS':
         min_encoder_length = 60 
-        add_relative_time_idx = False  # N-HiTS vyžaduje False
-        add_target_scales = False      # Pro N-HiTS raději vypneme
-    else: # TFT
+        add_relative_time_idx = False
+        add_target_scales = False
+    else:
         min_encoder_length = 30 
         add_relative_time_idx = True
         add_target_scales = True
 
-    # 2. Dataset
     training = TimeSeriesDataSet(
         data[lambda x: x.time_idx <= training_cutoff],
         time_idx="time_idx", target="target_scaled", group_ids=["group_id"],
-        min_encoder_length=min_encoder_length,
-        max_encoder_length=max_encoder_length,
+        min_encoder_length=min_encoder_length, max_encoder_length=max_encoder_length,
         min_prediction_length=1, max_prediction_length=1,
         static_categoricals=["group_id"],
         time_varying_known_categoricals=["is_weekend", "is_working_day", "is_holiday", "month"],
         time_varying_known_reals=["time_idx", "day_of_year", "temperature_2m", "temp_effective"],
         time_varying_unknown_reals=["target_scaled"],
         target_normalizer=GroupNormalizer(groups=["group_id"], transformation=None), 
-        
-        # Dynamické parametry
-        add_relative_time_idx=add_relative_time_idx, 
-        add_target_scales=add_target_scales, 
-        add_encoder_length=True,
+        add_relative_time_idx=add_relative_time_idx, add_target_scales=add_target_scales, add_encoder_length=True,
     )
     
     validation = TimeSeriesDataSet.from_dataset(training, data, predict=True, stop_randomization=True)
     train_dataloader = training.to_dataloader(train=True, batch_size=64, num_workers=0)
     val_dataloader = validation.to_dataloader(train=False, batch_size=128, num_workers=0)
 
-    # 3. Model Init
     if model_type == 'TFT':
-        model_base = TemporalFusionTransformer.from_dataset(
-            training, learning_rate=0.005, hidden_size=64, attention_head_size=4,
-            dropout=0.1, hidden_continuous_size=16, output_size=7, loss=QuantileLoss()
-        )
+        model_base = TemporalFusionTransformer.from_dataset(training, learning_rate=0.005, hidden_size=64, attention_head_size=4, dropout=0.1, hidden_continuous_size=16, output_size=7, loss=QuantileLoss())
     elif model_type == 'N-HiTS':
-        model_base = NHiTS.from_dataset(
-            training, 
-            learning_rate=0.001, 
-            weight_decay=1e-2,
-            loss=QuantileLoss(),
-            backcast_loss_ratio=0.0,
-        )
+        model_base = NHiTS.from_dataset(training, learning_rate=0.001, weight_decay=1e-2, loss=QuantileLoss(), backcast_loss_ratio=0.0)
     
-    # Wrap & Train
     model = PLWrapper(model_base)
     trainer = pl.Trainer(max_epochs=max_epochs, accelerator="cpu", gradient_clip_val=0.1, enable_checkpointing=True, logger=False)
     trainer.barebones = False
-    
     trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
     
-    # --- LOAD BEST MODEL (MANUAL WEIGHT LOADING) ---
     best_path = trainer.checkpoint_callback.best_model_path
     print(f"Loading best {model_type} model from: {best_path}")
     
-    # 1. Načteme raw checkpoint
     checkpoint = torch.load(best_path, map_location="cpu")
-    # 2. Získáme state_dict
     state_dict = checkpoint["state_dict"]
-    # 3. Očistíme klíče
     new_state_dict = {}
     for k, v in state_dict.items():
-        if k.startswith("model."):
-            new_state_dict[k[6:]] = v 
-        else:
-            new_state_dict[k] = v
-    # 4. Nahrajeme
+        if k.startswith("model."): new_state_dict[k[6:]] = v 
+        else: new_state_dict[k] = v
     model_base.load_state_dict(new_state_dict)
     
-    # 5. Zabalíme
     best_model = PLWrapper(model_base)
-    best_model.model.trainer = trainer
-    best_model.trainer = trainer
+    best_model.model.trainer = trainer; best_model.trainer = trainer
     
-    # 4. Predict Logic
     test_start_row = data[data['date'] >= split_date].index[0]
     inference_start_idx = max(0, test_start_row - max_encoder_length)
     inference_data = data.iloc[inference_start_idx:].reset_index(drop=True)
-    
     inference_dataset = TimeSeriesDataSet.from_dataset(training, inference_data, predict=False, stop_randomization=True)
     inference_dataloader = inference_dataset.to_dataloader(train=False, batch_size=64, num_workers=0)
     
     raw_predictions = best_model.model.predict(inference_dataloader, mode="prediction", return_x=True)
-    
     preds_scaled = raw_predictions.output.cpu().numpy().flatten()
     time_indices = raw_predictions.x["decoder_time_idx"].cpu().numpy().flatten()
     
@@ -361,18 +388,13 @@ def run_deep_model(full_df, split_date, target_col, model_type='TFT', max_epochs
     
     res_df = pd.DataFrame({'time_idx': time_indices.astype(int), 'pred': preds_final})
     pred_map = dict(zip(res_df.time_idx, res_df.pred))
-    
     final_preds = []
     target_indices = data[data['date'] >= split_date]['time_idx'].values.astype(int)
-    
-    found_count = 0
     for tidx in target_indices:
         val = pred_map.get(tidx, np.nan)
-        if not np.isnan(val): found_count += 1
         final_preds.append(val)
         
-    print(f"{model_type} Alignment: Matched {found_count}/{len(target_indices)} days.")
-    
+    print(f"{model_type} Alignment: Matched {len([x for x in final_preds if not np.isnan(x)])}/{len(target_indices)} days.")
     preds_array = np.array(final_preds)
     if np.isnan(preds_array).any():
         mask = np.isnan(preds_array)
@@ -381,42 +403,35 @@ def run_deep_model(full_df, split_date, target_col, model_type='TFT', max_epochs
     return preds_array
 
 # ==========================================
-# 4. OPTIMIZATION SOLVERS & BANDITS
+# 4. OPTIMIZATION & BANDITS
 # ==========================================
-
 class ContextualBanditEnsemble:
     def __init__(self, n_arms, n_features, alpha=0.1):
-        self.n_arms = n_arms
-        self.alpha = alpha
+        self.n_arms = n_arms; self.alpha = alpha
         self.A = [np.identity(n_features) for _ in range(n_arms)]
         self.b = [np.zeros(n_features) for _ in range(n_arms)]
-        
     def select_arm(self, context_vector):
         p = np.zeros(self.n_arms)
         for a in range(self.n_arms):
-            try:
-                theta = np.linalg.solve(self.A[a], self.b[a])
-            except:
-                theta = np.linalg.inv(self.A[a]) @ self.b[a]
+            try: theta = np.linalg.solve(self.A[a], self.b[a])
+            except: theta = np.linalg.inv(self.A[a]) @ self.b[a]
             mean = theta @ context_vector
             var = context_vector.T @ np.linalg.inv(self.A[a]) @ context_vector
             p[a] = mean + self.alpha * np.sqrt(var)
         return np.argmax(p)
-    
     def update_all(self, context_vector, rewards):
         for a in range(self.n_arms):
             self.A[a] += np.outer(context_vector, context_vector)
             self.b[a] += rewards[a] * context_vector
 
 def run_contextual_bandits_online(full_preds_df, test_start_date, model_cols, target_col='Actual', features_cols=None):
-    print("--- Running Online Contextual Bandits (Full History) ---")
+    print("--- Running Online Contextual Bandits ---")
     df = full_preds_df.sort_values('date').reset_index(drop=True)
     test_indices = df[df['date'] >= test_start_date].index
     if features_cols is None:
         possible_feats = ['temperature_2m', 'temp_effective', 'day_of_year', 'is_weekend', 'wind_speed_10m']
         features_cols = [c for c in possible_feats if c in df.columns]
-    n_models = len(model_cols)
-    n_features = len(features_cols) + 1 # +1 bias
+    n_models = len(model_cols); n_features = len(features_cols) + 1
     bandit = ContextualBanditEnsemble(n_models, n_features, alpha=0.5)
     
     warmup_start = max(0, test_indices[0] - 60)
@@ -432,18 +447,16 @@ def run_contextual_bandits_online(full_preds_df, test_start_date, model_cols, ta
         ensemble_preds.append(df.loc[idx, model_cols[chosen]])
         rewards = -np.abs(df.loc[idx, model_cols].values - df.loc[idx, target_col])
         bandit.update_all(ctx, rewards)
-        
     return np.array(ensemble_preds)
 
 def run_contextual_bandits_rolling(full_preds_df, test_start_date, model_cols, target_col='Actual', features_cols=None, strategy='month'):
-    print(f"--- Running Rolling Contextual Bandits (Strategy: {strategy}) ---")
+    print(f"--- Running Rolling Bandits ({strategy}) ---")
     df = full_preds_df.sort_values('date').reset_index(drop=True)
     test_indices = df[df['date'] >= test_start_date].index
     if features_cols is None:
         possible_feats = ['temperature_2m', 'temp_effective', 'day_of_year', 'is_weekend', 'wind_speed_10m']
         features_cols = [c for c in possible_feats if c in df.columns]
-    n_models = len(model_cols)
-    n_features = len(features_cols) + 1
+    n_models = len(model_cols); n_features = len(features_cols) + 1
     ensemble_preds = []
     
     for idx in test_indices:
@@ -471,7 +484,6 @@ def run_contextual_bandits_rolling(full_preds_df, test_start_date, model_cols, t
         ensemble_preds.append(df.loc[idx, model_cols[chosen]])
     return np.array(ensemble_preds)
 
-# --- Standard Solvers ---
 def solve_weights(X, y, method='frank_wolfe'):
     n_samples, n_models = X.shape
     if method == 'frank_wolfe':
@@ -527,48 +539,31 @@ def plot_weights_evolution(full_preds_df, test_start_date, model_cols, target_co
     print(f"--- Plotting Weights: {method} | {strategy} ---")
     df = full_preds_df.sort_values('date').reset_index(drop=True)
     test_indices = df[df['date'] >= test_start_date].index
-    
-    weights_history = []
-    dates = []
-    
+    weights_history = []; dates = []
     for idx in test_indices:
         target_date = df.loc[idx, 'date']
         data_avail_until = target_date - timedelta(days=2)
-        
         if strategy == 'week': win_start = data_avail_until - timedelta(days=6)
         else: win_start = data_avail_until - timedelta(days=30)
-        
         mask = (df['date'] >= win_start) & (df['date'] <= data_avail_until)
         hist_df = df.loc[mask].copy()
-        
         if strategy == 'weighted_month':
             w_start = data_avail_until - timedelta(days=6)
             w_df = hist_df.loc[hist_df['date'] >= w_start]
             hist_df = pd.concat([hist_df, w_df, w_df], axis=0)
-        
         if len(hist_df) < 5: hist_df = df.loc[df['date'] <= data_avail_until]
-        
-        X_h = hist_df[model_cols].values
-        y_h = hist_df[target_col].values
-        
+        X_h = hist_df[model_cols].values; y_h = hist_df[target_col].values
         w_opt = solve_weights(X_h, y_h, method=method)
-        weights_history.append(w_opt)
-        dates.append(target_date)
-        
+        weights_history.append(w_opt); dates.append(target_date)
     weights_df = pd.DataFrame(weights_history, columns=model_cols, index=dates)
-    
     plt.figure(figsize=(18, 9))
     plt.stackplot(weights_df.index, weights_df.T, labels=weights_df.columns, alpha=0.85)
     plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
     plt.title(f'Weights Evolution ({method} | {strategy})', fontsize=16)
-    plt.ylabel('Weight', fontsize=12)
-    plt.xlabel('Date', fontsize=12)
-    plt.margins(0, 0)
-    plt.tight_layout()
+    plt.ylabel('Weight', fontsize=12); plt.xlabel('Date', fontsize=12)
+    plt.margins(0, 0); plt.tight_layout()
     filename = f"weights_evolution_{method}_{strategy}.png"
-    plt.savefig(os.path.join(folder, filename), dpi=300)
-    plt.close()
-    
+    plt.savefig(os.path.join(folder, filename), dpi=300); plt.close()
     csv_filename = f"weights_history_{method}_{strategy}.csv"
     weights_df.to_csv(os.path.join(CONFIG['output_data'], csv_filename))
 
@@ -590,22 +585,16 @@ def generate_report(test_df, cols, title, folder, filename):
     print(f"\n--- {title} ---")
     print(df_m)
     df_m.to_latex(os.path.join(folder, f"{filename}.tex"), index=False, float_format="%.2f")
-    
     plt.figure(figsize=(14, 7))
     plt.plot(test_df['date'], test_df['Actual'], 'k-', lw=2, label='Actual', alpha=0.8)
     cmap = plt.get_cmap('tab10')
     for i, c in enumerate(cols):
         if c in test_df.columns:
             plt.plot(test_df['date'], test_df[c], ls='--', alpha=0.7, label=c, color=cmap(i))
-    plt.title(title)
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(folder, f"{filename}.png"), dpi=300)
-    plt.close()
+    plt.title(title); plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+    plt.savefig(os.path.join(folder, f"{filename}.png"), dpi=300); plt.close()
 
 def main():
-    # 1. Data & Models
     df = prepare_dataset()
     test_start = pd.to_datetime(CONFIG['split_test_date'])
     val_start = pd.to_datetime(CONFIG['split_val_date'])
@@ -650,7 +639,6 @@ def main():
     m_knn = optimize_model('KNN', X_train_sc, y_train, X_val_sc, y_val, CONFIG['hyperopt_evals'])
     full_preds['KNN'] = predict_all(m_knn, is_scaled=True)
     
-    # NOVÉ: Extra Trees
     m_et = optimize_model('ExtraTrees', X_train, y_train, X_val, y_val, CONFIG['hyperopt_evals'])
     full_preds['ExtraTrees'] = predict_all(m_et)
     
@@ -667,6 +655,11 @@ def main():
         fut = pd.concat([val_df, test_df])[['date', 'is_working_day', 'temperature_2m']].rename(columns={'date':'ds'})
         full_preds['Prophet'] = m.predict(fut)['yhat'].values
         
+    if NEURALPROPHET_AVAILABLE:
+        np_preds = run_neural_prophet(df, val_start, target) # Posíláme celý df a split date
+        if np_preds is not None and len(np_preds) == len(full_preds):
+            full_preds['NeuralProphet'] = np_preds
+        
     if SARIMAX_AVAILABLE:
         print("9. SARIMAX (Fixed)...")
         full_preds['SARIMAX'] = train_sarimax(y_train, X_train, X_val, X_test)
@@ -675,11 +668,9 @@ def main():
         tft_preds = run_deep_model(df, val_start, target, model_type='TFT', max_epochs=CONFIG['tft_epochs'])
         if len(tft_preds) == len(full_preds): full_preds['TFT'] = tft_preds
         
-        # NOVÉ: N-HiTS
         nhits_preds = run_deep_model(df, val_start, target, model_type='N-HiTS', max_epochs=CONFIG['tft_epochs'])
         if len(nhits_preds) == len(full_preds): full_preds['N-HiTS'] = nhits_preds
 
-    # 2. Ensemble
     print("\n--- Generating Ensembles ---")
     model_cols = [c for c in full_preds.columns if c not in ['date', 'Actual']]
     test_res = full_preds[full_preds['date'] >= test_start].copy()
@@ -693,15 +684,12 @@ def main():
             col_name = f"{method}_{label}"
             test_res[col_name] = get_rolling_weights(full_preds, test_start, model_cols, strategy=strat, method=method)
 
-    # 2b. BANDITS
     test_res['Bandit_Online'] = run_contextual_bandits_online(full_preds, test_start, model_cols, target_col='Actual')
     for strat in ['week', 'month', 'weighted_month']:
         col_name = f"Bandit_Rolling_{strat}"
         test_res[col_name] = run_contextual_bandits_rolling(full_preds, test_start, model_cols, target_col='Actual', strategy=strat)
 
-    # 3. Reports & Weight Plots
     out_dir = CONFIG['output_graphs']
-    
     generate_report(test_res, model_cols, "Prediction Models Performance", out_dir, "report_1_base_models")
     
     for label, title in [('Last_Week', 'Ensemble Opt: a) Last Week Data'),
@@ -713,7 +701,6 @@ def main():
     bandit_cols = [c for c in test_res.columns if 'Bandit' in c] + ['Ensemble_Avg']
     generate_report(test_res, bandit_cols, "Contextual Bandits Comparison", out_dir, "report_3_bandits")
 
-    # Generate Weight Plots for ALL Combinations
     for method in methods:
         for strat in ['week', 'month', 'weighted_month']:
             plot_weights_evolution(full_preds, test_start, model_cols, target_col='Actual', folder=out_dir, method=method, strategy=strat)
