@@ -11,6 +11,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.linear_model import ElasticNet
 from sklearn.svm import SVR
 from sklearn.neighbors import KNeighborsRegressor
+from sklearn.ensemble import ExtraTreesRegressor  # NOVÉ
 from sklearn.compose import TransformedTargetRegressor
 from scipy.optimize import nnls, minimize
 import joblib
@@ -21,7 +22,7 @@ import holidays
 from datetime import datetime, timedelta
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 
-# --- Optional Imports ---
+# --- Volitelné importy ---
 try:
     from catboost import CatBoostRegressor
     CATBOOST_AVAILABLE = True
@@ -46,7 +47,7 @@ except ImportError:
 try:
     os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "gloo"
     import pytorch_lightning as pl
-    from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
+    from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet, NHiTS # NOVÉ: NHiTS
     from pytorch_forecasting.data import GroupNormalizer
     from pytorch_forecasting.metrics import QuantileLoss
     TFT_AVAILABLE = True
@@ -150,12 +151,18 @@ def get_hyperopt_space(model_name):
         return {'C': hp.loguniform('C', np.log(0.1), np.log(100)), 'gamma': hp.choice('gamma', ['scale', 'auto', 0.1, 0.01])}
     elif model_name == 'KNN':
         return {'n_neighbors': hp.quniform('n', 3, 30, 1)}
+    elif model_name == 'ExtraTrees': # NOVÉ
+        return {
+            'n_estimators': hp.quniform('n_est', 100, 1000, 50),
+            'max_depth': hp.quniform('md', 5, 30, 1),
+            'min_samples_split': hp.quniform('min_samp', 2, 10, 1)
+        }
     return {}
 
 def optimize_model(model_name, X_train, y_train, X_val, y_val, evals=10):
     space = get_hyperopt_space(model_name)
     def objective(params):
-        for p in ['max_depth', 'n_estimators', 'num_leaves', 'depth', 'iterations', 'n_neighbors']:
+        for p in ['max_depth', 'n_estimators', 'num_leaves', 'depth', 'iterations', 'n_neighbors', 'min_samples_split']:
             if p in params: params[p] = int(params[p])
         
         if model_name == 'XGBoost': model = xgb.XGBRegressor(**params, random_state=42, n_jobs=-1)
@@ -165,6 +172,8 @@ def optimize_model(model_name, X_train, y_train, X_val, y_val, evals=10):
         elif model_name == 'SVR': 
             svr = SVR(**params)
             model = TransformedTargetRegressor(regressor=svr, transformer=StandardScaler())
+        elif model_name == 'ExtraTrees': # NOVÉ
+            model = ExtraTreesRegressor(**params, random_state=42, n_jobs=-1)
         
         model.fit(X_train, y_train)
         preds = model.predict(X_val)
@@ -208,7 +217,7 @@ def train_lstm(X_train, y_train, X_predict, X_dim):
     return scaler_y.inverse_transform(preds).flatten()
 
 def train_sarimax(y_train, X_train, X_val, X_test):
-    print("  -> Fitting SARIMAX (this might take a while)...")
+    print("  -> Fitting SARIMAX...")
     model = SARIMAX(y_train, exog=X_train, order=(1, 1, 1), seasonal_order=(1, 0, 0, 7), 
                     enforce_stationarity=False, enforce_invertibility=False)
     results = model.fit(disp=False)
@@ -218,12 +227,12 @@ def train_sarimax(y_train, X_train, X_val, X_test):
     full_preds = results.predict(start=start_idx, end=end_idx, exog=X_forecast)
     return full_preds
 
-# --- TFT WRAPPER (FIXED) ---
+# --- WRAPPERS PRO DEEP LEARNING (TFT & N-HiTS) ---
 if TFT_AVAILABLE:
-    class TFTWrapper(pl.LightningModule):
-        def __init__(self, tft_model):
+    class PLWrapper(pl.LightningModule):
+        def __init__(self, model):
             super().__init__()
-            self.model = tft_model
+            self.model = model
             self.model.log = self.safe_log 
         def safe_log(self, name, value, **kwargs):
             if value is None: return
@@ -235,11 +244,12 @@ if TFT_AVAILABLE:
             self.model.trainer = self.trainer; return self.model.validation_step(b, i)
         def configure_optimizers(self): return self.model.configure_optimizers()
 
-def run_tft_model(full_df, split_date, target_col, max_epochs=30):
+def run_deep_model(full_df, split_date, target_col, model_type='TFT', max_epochs=30):
     if not TFT_AVAILABLE: return np.zeros(len(full_df[full_df['date'] >= split_date]))
-    print("--- Training TFT (Final Integrated Fix) ---")
+    print(f"--- Training {model_type} (Integrated Fix V3) ---")
     data = full_df.copy()
     
+    # 1. Log Transform & Scaler
     data['target_log'] = np.log1p(data[target_col])
     train_indices = data[data['date'] < split_date].index
     scaler = StandardScaler()
@@ -253,52 +263,95 @@ def run_tft_model(full_df, split_date, target_col, max_epochs=30):
     
     cutoff_idx = data[data['date'] >= split_date].iloc[0]['time_idx']
     training_cutoff = cutoff_idx - 1
+    
+    # --- MODEL SPECIFIC CONFIG ---
     max_encoder_length = 60
+    if model_type == 'N-HiTS':
+        min_encoder_length = 60 
+        add_relative_time_idx = False  # N-HiTS vyžaduje False
+        add_target_scales = False      # Pro N-HiTS raději vypneme
+    else: # TFT
+        min_encoder_length = 30 
+        add_relative_time_idx = True
+        add_target_scales = True
 
+    # 2. Dataset
     training = TimeSeriesDataSet(
         data[lambda x: x.time_idx <= training_cutoff],
         time_idx="time_idx", target="target_scaled", group_ids=["group_id"],
-        min_encoder_length=30, max_encoder_length=max_encoder_length,
+        min_encoder_length=min_encoder_length,
+        max_encoder_length=max_encoder_length,
         min_prediction_length=1, max_prediction_length=1,
         static_categoricals=["group_id"],
         time_varying_known_categoricals=["is_weekend", "is_working_day", "is_holiday", "month"],
         time_varying_known_reals=["time_idx", "day_of_year", "temperature_2m", "temp_effective"],
         time_varying_unknown_reals=["target_scaled"],
         target_normalizer=GroupNormalizer(groups=["group_id"], transformation=None), 
-        add_relative_time_idx=True, add_target_scales=True, add_encoder_length=True,
+        
+        # Dynamické parametry
+        add_relative_time_idx=add_relative_time_idx, 
+        add_target_scales=add_target_scales, 
+        add_encoder_length=True,
     )
     
     validation = TimeSeriesDataSet.from_dataset(training, data, predict=True, stop_randomization=True)
     train_dataloader = training.to_dataloader(train=True, batch_size=64, num_workers=0)
     val_dataloader = validation.to_dataloader(train=False, batch_size=128, num_workers=0)
 
-    tft_base = TemporalFusionTransformer.from_dataset(
-        training, learning_rate=0.005, hidden_size=64, attention_head_size=4,
-        dropout=0.1, hidden_continuous_size=16, output_size=7, loss=QuantileLoss()
-    )
+    # 3. Model Init
+    if model_type == 'TFT':
+        model_base = TemporalFusionTransformer.from_dataset(
+            training, learning_rate=0.005, hidden_size=64, attention_head_size=4,
+            dropout=0.1, hidden_continuous_size=16, output_size=7, loss=QuantileLoss()
+        )
+    elif model_type == 'N-HiTS':
+        model_base = NHiTS.from_dataset(
+            training, 
+            learning_rate=0.001, 
+            weight_decay=1e-2,
+            loss=QuantileLoss(),
+            backcast_loss_ratio=0.0,
+        )
     
-    tft = TFTWrapper(tft_base)
+    # Wrap & Train
+    model = PLWrapper(model_base)
     trainer = pl.Trainer(max_epochs=max_epochs, accelerator="cpu", gradient_clip_val=0.1, enable_checkpointing=True, logger=False)
     trainer.barebones = False
     
-    trainer.fit(tft, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
+    trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
     
+    # --- LOAD BEST MODEL (MANUAL WEIGHT LOADING) ---
     best_path = trainer.checkpoint_callback.best_model_path
-    print(f"Loading best TFT model from: {best_path}")
-    best_wrapper = TFTWrapper.load_from_checkpoint(best_path, tft_model=tft_base)
-    best_tft_model = best_wrapper.model
-    best_tft_model.trainer = trainer
+    print(f"Loading best {model_type} model from: {best_path}")
     
+    # 1. Načteme raw checkpoint
+    checkpoint = torch.load(best_path, map_location="cpu")
+    # 2. Získáme state_dict
+    state_dict = checkpoint["state_dict"]
+    # 3. Očistíme klíče
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("model."):
+            new_state_dict[k[6:]] = v 
+        else:
+            new_state_dict[k] = v
+    # 4. Nahrajeme
+    model_base.load_state_dict(new_state_dict)
+    
+    # 5. Zabalíme
+    best_model = PLWrapper(model_base)
+    best_model.model.trainer = trainer
+    best_model.trainer = trainer
+    
+    # 4. Predict Logic
     test_start_row = data[data['date'] >= split_date].index[0]
     inference_start_idx = max(0, test_start_row - max_encoder_length)
     inference_data = data.iloc[inference_start_idx:].reset_index(drop=True)
     
-    inference_dataset = TimeSeriesDataSet.from_dataset(
-        training, inference_data, predict=False, stop_randomization=True
-    )
+    inference_dataset = TimeSeriesDataSet.from_dataset(training, inference_data, predict=False, stop_randomization=True)
     inference_dataloader = inference_dataset.to_dataloader(train=False, batch_size=64, num_workers=0)
     
-    raw_predictions = best_tft_model.predict(inference_dataloader, mode="prediction", return_x=True)
+    raw_predictions = best_model.model.predict(inference_dataloader, mode="prediction", return_x=True)
     
     preds_scaled = raw_predictions.output.cpu().numpy().flatten()
     time_indices = raw_predictions.x["decoder_time_idx"].cpu().numpy().flatten()
@@ -318,7 +371,7 @@ def run_tft_model(full_df, split_date, target_col, max_epochs=30):
         if not np.isnan(val): found_count += 1
         final_preds.append(val)
         
-    print(f"TFT Alignment: Matched {found_count}/{len(target_indices)} days.")
+    print(f"{model_type} Alignment: Matched {found_count}/{len(target_indices)} days.")
     
     preds_array = np.array(final_preds)
     if np.isnan(preds_array).any():
@@ -470,7 +523,6 @@ def get_rolling_weights(full_preds_df, test_start_date, model_cols, target_col='
         preds.append(np.dot(df.loc[idx, model_cols].values, w_opt))
     return np.array(preds)
 
-# --- NOVÉ: VIZUALIZACE VAH PRO KAŽDÝ MODEL ---
 def plot_weights_evolution(full_preds_df, test_start_date, model_cols, target_col='Actual', folder='output_graphs', method='frank_wolfe', strategy='month'):
     print(f"--- Plotting Weights: {method} | {strategy} ---")
     df = full_preds_df.sort_values('date').reset_index(drop=True)
@@ -598,6 +650,10 @@ def main():
     m_knn = optimize_model('KNN', X_train_sc, y_train, X_val_sc, y_val, CONFIG['hyperopt_evals'])
     full_preds['KNN'] = predict_all(m_knn, is_scaled=True)
     
+    # NOVÉ: Extra Trees
+    m_et = optimize_model('ExtraTrees', X_train, y_train, X_val, y_val, CONFIG['hyperopt_evals'])
+    full_preds['ExtraTrees'] = predict_all(m_et)
+    
     enet = ElasticNet(alpha=0.1); enet.fit(X_train_sc, y_train)
     full_preds['ElasticNet'] = predict_all(enet, is_scaled=True)
     
@@ -616,10 +672,12 @@ def main():
         full_preds['SARIMAX'] = train_sarimax(y_train, X_train, X_val, X_test)
 
     if TFT_AVAILABLE:
-        tft_preds = run_tft_model(df, val_start, target, max_epochs=CONFIG['tft_epochs'])
-        if len(tft_preds) != len(full_preds): 
-            tft_preds = np.resize(tft_preds, len(full_preds))
-        full_preds['TFT'] = tft_preds
+        tft_preds = run_deep_model(df, val_start, target, model_type='TFT', max_epochs=CONFIG['tft_epochs'])
+        if len(tft_preds) == len(full_preds): full_preds['TFT'] = tft_preds
+        
+        # NOVÉ: N-HiTS
+        nhits_preds = run_deep_model(df, val_start, target, model_type='N-HiTS', max_epochs=CONFIG['tft_epochs'])
+        if len(nhits_preds) == len(full_preds): full_preds['N-HiTS'] = nhits_preds
 
     # 2. Ensemble
     print("\n--- Generating Ensembles ---")
@@ -641,7 +699,7 @@ def main():
         col_name = f"Bandit_Rolling_{strat}"
         test_res[col_name] = run_contextual_bandits_rolling(full_preds, test_start, model_cols, target_col='Actual', strategy=strat)
 
-    # 3. Reports & Vizualizace vah
+    # 3. Reports & Weight Plots
     out_dir = CONFIG['output_graphs']
     
     generate_report(test_res, model_cols, "Prediction Models Performance", out_dir, "report_1_base_models")
@@ -655,13 +713,13 @@ def main():
     bandit_cols = [c for c in test_res.columns if 'Bandit' in c] + ['Ensemble_Avg']
     generate_report(test_res, bandit_cols, "Contextual Bandits Comparison", out_dir, "report_3_bandits")
 
-    # --- GENERATE WEIGHT PLOTS FOR ALL COMBINATIONS ---
+    # Generate Weight Plots for ALL Combinations
     for method in methods:
         for strat in ['week', 'month', 'weighted_month']:
             plot_weights_evolution(full_preds, test_start, model_cols, target_col='Actual', folder=out_dir, method=method, strategy=strat)
 
     test_res.to_csv(os.path.join(CONFIG['output_data'], 'final_results_complete.csv'), index=False)
-    print(f"\nAll Done. Reports and weight plots saved to {out_dir}")
+    print(f"\nAll Done. Reports saved to {out_dir}")
 
 if __name__ == "__main__":
     main()
