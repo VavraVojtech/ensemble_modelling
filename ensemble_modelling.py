@@ -21,7 +21,7 @@ import holidays
 from datetime import datetime, timedelta
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 
-# --- Volitelné importy ---
+# --- Optional Imports ---
 try:
     from catboost import CatBoostRegressor
     CATBOOST_AVAILABLE = True
@@ -35,6 +35,13 @@ try:
 except ImportError:
     PROPHET_AVAILABLE = False
     print("Warning: Prophet not installed.")
+
+try:
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    SARIMAX_AVAILABLE = True
+except ImportError:
+    SARIMAX_AVAILABLE = False
+    print("Warning: statsmodels not installed. SARIMAX will be skipped.")
 
 try:
     os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "gloo"
@@ -55,16 +62,16 @@ logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 # 1. KONFIGURACE
 # ==========================================
 CONFIG = {
-    'input_folder'      : 'input_data',
-    'output_models'     : 'models',
-    'output_graphs'     : 'output_graph',
-    'output_data'       : 'output_data',
-    'split_test_date'   : '2024-12-01',
-    'split_val_date'    : '2024-10-01',
-    'target_col'        : 'spotreba_cr',
-    'seed'              : 42,
-    'hyperopt_evals'    : 50,
-    'tft_epochs'        : 50
+    'input_folder': 'input_data',
+    'output_models': 'models',
+    'output_graphs': 'output_graph',
+    'output_data': 'output_data',
+    'split_test_date': '2024-12-01',  
+    'split_val_date': '2024-10-01',   
+    'target_col': 'spotreba_cr',
+    'seed': 42,
+    'hyperopt_evals': 2,             
+    'tft_epochs': 2
 }
 
 for folder in [CONFIG['output_models'], CONFIG['output_graphs'], CONFIG['output_data']]:
@@ -200,13 +207,23 @@ def train_lstm(X_train, y_train, X_predict, X_dim):
         preds = model(X_p_t).numpy()
     return scaler_y.inverse_transform(preds).flatten()
 
+def train_sarimax(y_train, X_train, X_val, X_test):
+    print("  -> Fitting SARIMAX (this might take a while)...")
+    model = SARIMAX(y_train, exog=X_train, order=(1, 1, 1), seasonal_order=(1, 0, 0, 7), 
+                    enforce_stationarity=False, enforce_invertibility=False)
+    results = model.fit(disp=False)
+    X_forecast = np.concatenate([X_val, X_test])
+    start_idx = len(y_train)
+    end_idx = start_idx + len(X_forecast) - 1
+    full_preds = results.predict(start=start_idx, end=end_idx, exog=X_forecast)
+    return full_preds
+
 # --- TFT WRAPPER (FIXED) ---
 if TFT_AVAILABLE:
     class TFTWrapper(pl.LightningModule):
         def __init__(self, tft_model):
             super().__init__()
             self.model = tft_model
-            # Logování bezpečné
             self.model.log = self.safe_log 
         def safe_log(self, name, value, **kwargs):
             if value is None: return
@@ -223,9 +240,7 @@ def run_tft_model(full_df, split_date, target_col, max_epochs=30):
     print("--- Training TFT (Final Integrated Fix) ---")
     data = full_df.copy()
     
-    # 1. Log Transform & Scaler
     data['target_log'] = np.log1p(data[target_col])
-    
     train_indices = data[data['date'] < split_date].index
     scaler = StandardScaler()
     scaler.fit(data.loc[train_indices, 'target_log'].values.reshape(-1, 1))
@@ -266,46 +281,31 @@ def run_tft_model(full_df, split_date, target_col, max_epochs=30):
     trainer = pl.Trainer(max_epochs=max_epochs, accelerator="cpu", gradient_clip_val=0.1, enable_checkpointing=True, logger=False)
     trainer.barebones = False
     
-    # Train
     trainer.fit(tft, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
     
-    # --- LOAD BEST MODEL & PREDICT (Corrected) ---
     best_path = trainer.checkpoint_callback.best_model_path
     print(f"Loading best TFT model from: {best_path}")
     best_wrapper = TFTWrapper.load_from_checkpoint(best_path, tft_model=tft_base)
     best_tft_model = best_wrapper.model
     best_tft_model.trainer = trainer
     
-    # --- OPRAVA PŘÍPRAVY DAT PRO PREDIKCI ---
-    # Musíme vytvořit dataset, který obsahuje i historická data před 'split_date',
-    # abychom mohli predikovat hned od prvního dne testu.
-    # Vezmeme data od (split_date - encoder_length) až do konce.
-    
     test_start_row = data[data['date'] >= split_date].index[0]
     inference_start_idx = max(0, test_start_row - max_encoder_length)
-    
-    # Vyfiltrujeme data pro inferenci (reset_index zachová sloupce, ale time_idx musí být globální)
     inference_data = data.iloc[inference_start_idx:].reset_index(drop=True)
     
-    # Vytvoříme dataset BEZ predict=True (chceme sliding window přes celou testovací sadu)
     inference_dataset = TimeSeriesDataSet.from_dataset(
         training, inference_data, predict=False, stop_randomization=True
     )
-    
     inference_dataloader = inference_dataset.to_dataloader(train=False, batch_size=64, num_workers=0)
     
-    print(f"Predicting on {len(inference_data)} rows...")
     raw_predictions = best_tft_model.predict(inference_dataloader, mode="prediction", return_x=True)
     
-    # Extract
     preds_scaled = raw_predictions.output.cpu().numpy().flatten()
     time_indices = raw_predictions.x["decoder_time_idx"].cpu().numpy().flatten()
     
-    # Inverse Transform
     preds_log = scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
     preds_final = np.expm1(preds_log)
     
-    # Mapping
     res_df = pd.DataFrame({'time_idx': time_indices.astype(int), 'pred': preds_final})
     pred_map = dict(zip(res_df.time_idx, res_df.pred))
     
@@ -320,90 +320,205 @@ def run_tft_model(full_df, split_date, target_col, max_epochs=30):
         
     print(f"TFT Alignment: Matched {found_count}/{len(target_indices)} days.")
     
-    # Interpolace (pokud by chybělo pár dní)
     preds_array = np.array(final_preds)
     if np.isnan(preds_array).any():
-        print("Warning: Interpolating missing TFT predictions.")
         mask = np.isnan(preds_array)
         preds_array[mask] = np.interp(np.flatnonzero(mask), np.flatnonzero(~mask), preds_array[~mask])
         
     return preds_array
 
 # ==========================================
-# 4. OPTIMIZATION SOLVERS
+# 4. OPTIMIZATION SOLVERS & BANDITS
 # ==========================================
 
+class ContextualBanditEnsemble:
+    def __init__(self, n_arms, n_features, alpha=0.1):
+        self.n_arms = n_arms
+        self.alpha = alpha
+        self.A = [np.identity(n_features) for _ in range(n_arms)]
+        self.b = [np.zeros(n_features) for _ in range(n_arms)]
+        
+    def select_arm(self, context_vector):
+        p = np.zeros(self.n_arms)
+        for a in range(self.n_arms):
+            try:
+                theta = np.linalg.solve(self.A[a], self.b[a])
+            except:
+                theta = np.linalg.inv(self.A[a]) @ self.b[a]
+            mean = theta @ context_vector
+            var = context_vector.T @ np.linalg.inv(self.A[a]) @ context_vector
+            p[a] = mean + self.alpha * np.sqrt(var)
+        return np.argmax(p)
+    
+    def update_all(self, context_vector, rewards):
+        for a in range(self.n_arms):
+            self.A[a] += np.outer(context_vector, context_vector)
+            self.b[a] += rewards[a] * context_vector
+
+def run_contextual_bandits_online(full_preds_df, test_start_date, model_cols, target_col='Actual', features_cols=None):
+    print("--- Running Online Contextual Bandits (Full History) ---")
+    df = full_preds_df.sort_values('date').reset_index(drop=True)
+    test_indices = df[df['date'] >= test_start_date].index
+    if features_cols is None:
+        possible_feats = ['temperature_2m', 'temp_effective', 'day_of_year', 'is_weekend', 'wind_speed_10m']
+        features_cols = [c for c in possible_feats if c in df.columns]
+    n_models = len(model_cols)
+    n_features = len(features_cols) + 1 # +1 bias
+    bandit = ContextualBanditEnsemble(n_models, n_features, alpha=0.5)
+    
+    warmup_start = max(0, test_indices[0] - 60)
+    for idx in range(warmup_start, test_indices[0]):
+        ctx = np.append(df.loc[idx, features_cols].values.astype(float), 1.0)
+        rewards = -np.abs(df.loc[idx, model_cols].values - df.loc[idx, target_col])
+        bandit.update_all(ctx, rewards)
+        
+    ensemble_preds = []
+    for idx in test_indices:
+        ctx = np.append(df.loc[idx, features_cols].values.astype(float), 1.0)
+        chosen = bandit.select_arm(ctx)
+        ensemble_preds.append(df.loc[idx, model_cols[chosen]])
+        rewards = -np.abs(df.loc[idx, model_cols].values - df.loc[idx, target_col])
+        bandit.update_all(ctx, rewards)
+        
+    return np.array(ensemble_preds)
+
+def run_contextual_bandits_rolling(full_preds_df, test_start_date, model_cols, target_col='Actual', features_cols=None, strategy='month'):
+    print(f"--- Running Rolling Contextual Bandits (Strategy: {strategy}) ---")
+    df = full_preds_df.sort_values('date').reset_index(drop=True)
+    test_indices = df[df['date'] >= test_start_date].index
+    if features_cols is None:
+        possible_feats = ['temperature_2m', 'temp_effective', 'day_of_year', 'is_weekend', 'wind_speed_10m']
+        features_cols = [c for c in possible_feats if c in df.columns]
+    n_models = len(model_cols)
+    n_features = len(features_cols) + 1
+    ensemble_preds = []
+    
+    for idx in test_indices:
+        target_date = df.loc[idx, 'date']
+        data_avail_until = target_date - timedelta(days=2)
+        if strategy == 'week': win_start = data_avail_until - timedelta(days=6)
+        else: win_start = data_avail_until - timedelta(days=30)
+        mask = (df['date'] >= win_start) & (df['date'] <= data_avail_until)
+        hist_df = df.loc[mask].copy()
+        if strategy == 'weighted_month':
+            w_start = data_avail_until - timedelta(days=6)
+            w_df = hist_df.loc[hist_df['date'] >= w_start]
+            hist_df = pd.concat([hist_df, w_df, w_df], axis=0)
+        if len(hist_df) < 5: hist_df = df.loc[df['date'] <= data_avail_until]
+
+        bandit = ContextualBanditEnsemble(n_models, n_features, alpha=0.2)
+        X_ctx = np.c_[hist_df[features_cols].values.astype(float), np.ones(len(hist_df))]
+        y_act = hist_df[target_col].values
+        m_preds = hist_df[model_cols].values
+        rewards_matrix = -np.abs(m_preds - y_act[:, None])
+        for i in range(len(hist_df)):
+            bandit.update_all(X_ctx[i], rewards_matrix[i])
+        curr_ctx = np.append(df.loc[idx, features_cols].values.astype(float), 1.0)
+        chosen = bandit.select_arm(curr_ctx)
+        ensemble_preds.append(df.loc[idx, model_cols[chosen]])
+    return np.array(ensemble_preds)
+
+# --- Standard Solvers ---
 def solve_weights(X, y, method='frank_wolfe'):
     n_samples, n_models = X.shape
-    
     if method == 'frank_wolfe':
         w = np.ones(n_models) / n_models
         for k in range(500):
             resid = np.dot(X, w) - y
             grad = (2/n_samples) * np.dot(X.T, resid)
-            s = np.zeros(n_models)
-            s[np.argmin(grad)] = 1.0
-            gamma = 2.0 / (k + 2.0)
-            w = (1 - gamma) * w + gamma * s
+            s = np.zeros(n_models); s[np.argmin(grad)] = 1.0
+            gamma = 2.0 / (k + 2.0); w = (1 - gamma) * w + gamma * s
         return w
-
     elif method == 'nnls':
         w, _ = nnls(X, y)
         if np.sum(w) == 0: return np.ones(n_models) / n_models
         return w / np.sum(w)
-
     elif method == 'ensemble_selection':
         pool = []
         best_single = np.argmin([mean_squared_error(y, X[:, i]) for i in range(n_models)])
-        pool.append(best_single)
-        curr_pred = X[:, best_single]
+        pool.append(best_single); curr_pred = X[:, best_single]
         for _ in range(20): 
             best_idx, best_err = -1, float('inf')
             for i in range(n_models):
                 tmp = (curr_pred * len(pool) + X[:, i]) / (len(pool) + 1)
                 err = mean_squared_error(y, tmp)
                 if err < best_err: best_err = err; best_idx = i
-            pool.append(best_idx)
-            curr_pred = (curr_pred * (len(pool)-1) + X[:, best_idx]) / len(pool)
-        w = np.zeros(n_models)
+            pool.append(best_idx); curr_pred = (curr_pred * (len(pool)-1) + X[:, best_idx]) / len(pool)
+        w = np.zeros(n_models); 
         for idx in pool: w[idx] += 1
         return w / np.sum(w)
-
     return np.ones(n_models) / n_models
 
 def get_rolling_weights(full_preds_df, test_start_date, model_cols, target_col='Actual', strategy='month', method='frank_wolfe'):
     df = full_preds_df.sort_values('date').reset_index(drop=True)
     test_indices = df[df['date'] >= test_start_date].index
     preds = []
-    
     for idx in test_indices:
         target_date = df.loc[idx, 'date']
         data_avail_until = target_date - timedelta(days=2) 
+        if strategy == 'week': win_start = data_avail_until - timedelta(days=6) 
+        else: win_start = data_avail_until - timedelta(days=30)
+        mask = (df['date'] >= win_start) & (df['date'] <= data_avail_until)
+        hist_df = df.loc[mask].copy()
+        if strategy == 'weighted_month':
+            w_start = data_avail_until - timedelta(days=6)
+            w_df = hist_df.loc[hist_df['date'] >= w_start]
+            hist_df = pd.concat([hist_df, w_df, w_df], axis=0)
+        if len(hist_df) < 5: hist_df = df.loc[df['date'] <= data_avail_until]
+        X_h = hist_df[model_cols].values; y_h = hist_df[target_col].values
+        w_opt = solve_weights(X_h, y_h, method=method)
+        preds.append(np.dot(df.loc[idx, model_cols].values, w_opt))
+    return np.array(preds)
+
+# --- NOVÉ: VIZUALIZACE VAH PRO KAŽDÝ MODEL ---
+def plot_weights_evolution(full_preds_df, test_start_date, model_cols, target_col='Actual', folder='output_graphs', method='frank_wolfe', strategy='month'):
+    print(f"--- Plotting Weights: {method} | {strategy} ---")
+    df = full_preds_df.sort_values('date').reset_index(drop=True)
+    test_indices = df[df['date'] >= test_start_date].index
+    
+    weights_history = []
+    dates = []
+    
+    for idx in test_indices:
+        target_date = df.loc[idx, 'date']
+        data_avail_until = target_date - timedelta(days=2)
         
-        if strategy == 'week':
-            win_start = data_avail_until - timedelta(days=6) 
-        else: 
-            win_start = data_avail_until - timedelta(days=30)
-            
+        if strategy == 'week': win_start = data_avail_until - timedelta(days=6)
+        else: win_start = data_avail_until - timedelta(days=30)
+        
         mask = (df['date'] >= win_start) & (df['date'] <= data_avail_until)
         hist_df = df.loc[mask].copy()
         
         if strategy == 'weighted_month':
             w_start = data_avail_until - timedelta(days=6)
             w_df = hist_df.loc[hist_df['date'] >= w_start]
-            # Duplikace 2x (total 3x)
             hist_df = pd.concat([hist_df, w_df, w_df], axis=0)
-            
+        
         if len(hist_df) < 5: hist_df = df.loc[df['date'] <= data_avail_until]
-
+        
         X_h = hist_df[model_cols].values
         y_h = hist_df[target_col].values
         
         w_opt = solve_weights(X_h, y_h, method=method)
-        ens_p = np.dot(df.loc[idx, model_cols].values, w_opt)
-        preds.append(ens_p)
+        weights_history.append(w_opt)
+        dates.append(target_date)
         
-    return np.array(preds)
+    weights_df = pd.DataFrame(weights_history, columns=model_cols, index=dates)
+    
+    plt.figure(figsize=(18, 9))
+    plt.stackplot(weights_df.index, weights_df.T, labels=weights_df.columns, alpha=0.85)
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    plt.title(f'Weights Evolution ({method} | {strategy})', fontsize=16)
+    plt.ylabel('Weight', fontsize=12)
+    plt.xlabel('Date', fontsize=12)
+    plt.margins(0, 0)
+    plt.tight_layout()
+    filename = f"weights_evolution_{method}_{strategy}.png"
+    plt.savefig(os.path.join(folder, filename), dpi=300)
+    plt.close()
+    
+    csv_filename = f"weights_history_{method}_{strategy}.csv"
+    weights_df.to_csv(os.path.join(CONFIG['output_data'], csv_filename))
 
 # ==========================================
 # 5. REPORTING
@@ -438,18 +553,16 @@ def generate_report(test_df, cols, title, folder, filename):
     plt.close()
 
 def main():
-    # 1. Data & Base Models
+    # 1. Data & Models
     df = prepare_dataset()
     test_start = pd.to_datetime(CONFIG['split_test_date'])
     val_start = pd.to_datetime(CONFIG['split_val_date'])
-    
     train_df = df[df['date'] < val_start]
     val_df = df[(df['date'] >= val_start) & (df['date'] < test_start)]
     test_df = df[df['date'] >= test_start]
     
     feats = [c for c in df.columns if c not in ['date', CONFIG['target_col']]]
     target = CONFIG['target_col']
-    
     X_train = train_df[feats].values; y_train = train_df[target].values
     X_val = val_df[feats].values; y_val = val_df[target].values
     X_test = test_df[feats].values
@@ -498,48 +611,57 @@ def main():
         fut = pd.concat([val_df, test_df])[['date', 'is_working_day', 'temperature_2m']].rename(columns={'date':'ds'})
         full_preds['Prophet'] = m.predict(fut)['yhat'].values
         
+    if SARIMAX_AVAILABLE:
+        print("9. SARIMAX (Fixed)...")
+        full_preds['SARIMAX'] = train_sarimax(y_train, X_train, X_val, X_test)
+
     if TFT_AVAILABLE:
-        # Voláme opravenou funkci
         tft_preds = run_tft_model(df, val_start, target, max_epochs=CONFIG['tft_epochs'])
-        # Zarovnání délky (pro jistotu, kdyby něco selhalo v interpolaci)
         if len(tft_preds) != len(full_preds): 
-            print(f"Warning: TFT length mismatch {len(tft_preds)} vs {len(full_preds)}. Resizing.")
             tft_preds = np.resize(tft_preds, len(full_preds))
         full_preds['TFT'] = tft_preds
 
-    # 2. Ensemble Generation
+    # 2. Ensemble
     print("\n--- Generating Ensembles ---")
     model_cols = [c for c in full_preds.columns if c not in ['date', 'Actual']]
     test_res = full_preds[full_preds['date'] >= test_start].copy()
     test_res['Ensemble_Avg'] = test_res[model_cols].mean(axis=1)
     
     methods = ['frank_wolfe', 'nnls', 'ensemble_selection']
-    windows = [
-        ('week', 'a_Last_Week'), 
-        ('month', 'b_Last_Month'), 
-        ('weighted_month', 'c_Weighted_Month')
-    ]
+    windows = [('week', 'a_Last_Week'), ('month', 'b_Last_Month'), ('weighted_month', 'c_Weighted_Month')]
     
     for method in methods:
         for strat, label in windows:
             col_name = f"{method}_{label}"
             test_res[col_name] = get_rolling_weights(full_preds, test_start, model_cols, strategy=strat, method=method)
 
-    # 3. Output
+    # 2b. BANDITS
+    test_res['Bandit_Online'] = run_contextual_bandits_online(full_preds, test_start, model_cols, target_col='Actual')
+    for strat in ['week', 'month', 'weighted_month']:
+        col_name = f"Bandit_Rolling_{strat}"
+        test_res[col_name] = run_contextual_bandits_rolling(full_preds, test_start, model_cols, target_col='Actual', strategy=strat)
+
+    # 3. Reports & Vizualizace vah
     out_dir = CONFIG['output_graphs']
     
-    # A) Base Models
     generate_report(test_res, model_cols, "Prediction Models Performance", out_dir, "report_1_base_models")
     
-    # B) Ensembles
     for label, title in [('Last_Week', 'Ensemble Opt: a) Last Week Data'),
                          ('Last_Month', 'Ensemble Opt: b) Last Month Data'),
                          ('Weighted_Month', 'Ensemble Opt: c) Weighted Month')]:
         cols = [c for c in test_res.columns if label in c] + ['Ensemble_Avg']
         generate_report(test_res, cols, title, out_dir, f"report_2_{label.lower()}")
 
+    bandit_cols = [c for c in test_res.columns if 'Bandit' in c] + ['Ensemble_Avg']
+    generate_report(test_res, bandit_cols, "Contextual Bandits Comparison", out_dir, "report_3_bandits")
+
+    # --- GENERATE WEIGHT PLOTS FOR ALL COMBINATIONS ---
+    for method in methods:
+        for strat in ['week', 'month', 'weighted_month']:
+            plot_weights_evolution(full_preds, test_start, model_cols, target_col='Actual', folder=out_dir, method=method, strategy=strat)
+
     test_res.to_csv(os.path.join(CONFIG['output_data'], 'final_results_complete.csv'), index=False)
-    print(f"\nAll Done. Reports saved to {out_dir}")
+    print(f"\nAll Done. Reports and weight plots saved to {out_dir}")
 
 if __name__ == "__main__":
     main()
