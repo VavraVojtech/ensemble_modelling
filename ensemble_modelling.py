@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.linear_model import ElasticNet
+from sklearn.linear_model import ElasticNet, BayesianRidge # NOVÉ: BayesianRidge
 from sklearn.svm import SVR
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.ensemble import ExtraTreesRegressor
@@ -20,6 +20,7 @@ import sys
 import warnings
 import holidays
 from datetime import datetime, timedelta
+import time
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 
 # --- Volitelné importy ---
@@ -49,7 +50,14 @@ try:
     SARIMAX_AVAILABLE = True
 except ImportError:
     SARIMAX_AVAILABLE = False
-    print("Warning: statsmodels not installed. SARIMAX will be skipped.")
+    print("Warning: statsmodels not installed.")
+
+try:
+    from tbats import TBATS # NOVÉ: TBATS
+    TBATS_AVAILABLE = True
+except ImportError:
+    TBATS_AVAILABLE = False
+    print("Warning: tbats not installed (pip install tbats).")
 
 try:
     os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "gloo"
@@ -65,7 +73,6 @@ except ImportError:
 warnings.filterwarnings('ignore')
 import logging
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
-# Potlačení logů NeuralProphetu
 logging.getLogger("neuralprophet").setLevel(logging.ERROR)
 
 # ==========================================
@@ -80,8 +87,8 @@ CONFIG = {
     'split_val_date': '2024-10-01',   
     'target_col': 'spotreba_cr',
     'seed': 42,
-    'hyperopt_evals': 2,             
-    'tft_epochs': 2
+    'hyperopt_evals': 100,
+    'tft_epochs': 100
 }
 
 for folder in [CONFIG['output_models'], CONFIG['output_graphs'], CONFIG['output_data']]:
@@ -147,7 +154,7 @@ def prepare_dataset():
     return df.reset_index(drop=True)
 
 # ==========================================
-# 3. MODELS & HYPEROPT
+# 3. MODELS
 # ==========================================
 def get_hyperopt_space(model_name):
     if model_name == 'XGBoost':
@@ -190,6 +197,7 @@ def optimize_model(model_name, X_train, y_train, X_val, y_val, evals=10):
     best_trial = min(trials.results, key=lambda x: x['loss'])
     return best_trial['model']
 
+# LSTM
 class LSTMNet(nn.Module):
     def __init__(self, input_dim, hidden_dim=64):
         super(LSTMNet, self).__init__()
@@ -221,6 +229,7 @@ def train_lstm(X_train, y_train, X_predict, X_dim):
         preds = model(X_p_t).numpy()
     return scaler_y.inverse_transform(preds).flatten()
 
+# Statistika (SARIMAX & TBATS)
 def train_sarimax(y_train, X_train, X_val, X_test):
     print("  -> Fitting SARIMAX...")
     model = SARIMAX(y_train, exog=X_train, order=(1, 1, 1), seasonal_order=(1, 0, 0, 7), 
@@ -232,62 +241,42 @@ def train_sarimax(y_train, X_train, X_val, X_test):
     full_preds = results.predict(start=start_idx, end=end_idx, exog=X_forecast)
     return full_preds
 
-# --- NEURAL PROPHET WRAPPER (NOVÉ) ---
+def train_tbats(y_train, y_val_test_len):
+    """NOVÉ: TBATS Model pro komplexní sezónnost"""
+    print("  -> Fitting TBATS (this is slow)...")
+    # TBATS si sám řeší sezónnost (weekly, yearly)
+    estimator = TBATS(seasonal_periods=[7, 365.25])
+    model = estimator.fit(y_train)
+    forecast = model.forecast(steps=y_val_test_len)
+    return forecast
+
+# Neural Prophet
 def run_neural_prophet(full_df, split_date, target_col):
     if not NEURALPROPHET_AVAILABLE: return None
     print("--- Training NeuralProphet ---")
-    
-    # 1. Prepare Data
     df_np = full_df[['date', target_col, 'temperature_2m', 'temp_effective', 'is_working_day', 'wind_speed_10m']].copy()
     df_np.rename(columns={'date': 'ds', target_col: 'y'}, inplace=True)
     
-    # 2. Setup Model
-    # Používáme Lagged regressors (AR) + Future regressors
-    m = NeuralProphet(
-        n_lags=7, # Auto-regrese (posledních 7 dní)
-        n_forecasts=1,
-        yearly_seasonality=True,
-        weekly_seasonality=True,
-        daily_seasonality=False,
-        batch_size=64,
-        epochs=30,
-        learning_rate=0.01,
-        trainer_config={'accelerator': 'cpu'} # Force CPU pro stabilitu
-    )
-    
-    # Add regressors
-    for reg in ['temperature_2m', 'temp_effective', 'is_working_day', 'wind_speed_10m']:
-        m.add_future_regressor(reg)
+    m = NeuralProphet(n_lags=7, n_forecasts=1, yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False,
+                      batch_size=64, epochs=30, learning_rate=0.01, trainer_config={'accelerator': 'cpu'})
+    for reg in ['temperature_2m', 'temp_effective', 'is_working_day', 'wind_speed_10m']: m.add_future_regressor(reg)
         
-    # 3. Fit
-    # NeuralProphet needs training set
     train_df_np = df_np[df_np['ds'] < split_date]
     m.fit(train_df_np, freq='D')
     
-    # 4. Predict
-    # NeuralProphet potřebuje historii pro AR lags, takže mu předhodíme celý dataset
-    # On si sám dopočítá predikce tam, kde může
     future = m.make_future_dataframe(df_np, periods=0, n_historic_predictions=True)
     forecast = m.predict(future)
-    
-    # 5. Extract and align
-    # Forecast má sloupec 'yhat1'. Musíme ho napárovat zpět k full_df podle data.
     forecast = forecast[['ds', 'yhat1']].rename(columns={'ds': 'date', 'yhat1': 'pred'})
     
-    # Merge to align with original df indices
     merged = pd.merge(full_df[['date']], forecast, on='date', how='left')
-    
-    # Filtrujeme jen valid/test část (od split_date)
     result_slice = merged[merged['date'] >= split_date]['pred'].values
     
-    # Fill NaN (start forecastu může chybět kvůli lagům)
     if np.isnan(result_slice).any():
         mask = np.isnan(result_slice)
         result_slice[mask] = np.interp(np.flatnonzero(mask), np.flatnonzero(~mask), result_slice[~mask])
-        
     return result_slice
 
-# --- DEEP LEARNING (TFT & N-HiTS) ---
+# Deep Learning (TFT & N-HiTS)
 if TFT_AVAILABLE:
     class PLWrapper(pl.LightningModule):
         def __init__(self, model):
@@ -306,8 +295,9 @@ if TFT_AVAILABLE:
 
 def run_deep_model(full_df, split_date, target_col, model_type='TFT', max_epochs=30):
     if not TFT_AVAILABLE: return np.zeros(len(full_df[full_df['date'] >= split_date]))
-    print(f"--- Training {model_type} ---")
+    print(f"--- Training {model_type} (Integrated Fix V3) ---")
     data = full_df.copy()
+    
     data['target_log'] = np.log1p(data[target_col])
     train_indices = data[data['date'] < split_date].index
     scaler = StandardScaler()
@@ -325,12 +315,10 @@ def run_deep_model(full_df, split_date, target_col, model_type='TFT', max_epochs
     max_encoder_length = 60
     if model_type == 'N-HiTS':
         min_encoder_length = 60 
-        add_relative_time_idx = False
-        add_target_scales = False
+        add_relative_time_idx = False; add_target_scales = False
     else:
         min_encoder_length = 30 
-        add_relative_time_idx = True
-        add_target_scales = True
+        add_relative_time_idx = True; add_target_scales = True
 
     training = TimeSeriesDataSet(
         data[lambda x: x.time_idx <= training_cutoff],
@@ -399,11 +387,10 @@ def run_deep_model(full_df, split_date, target_col, model_type='TFT', max_epochs
     if np.isnan(preds_array).any():
         mask = np.isnan(preds_array)
         preds_array[mask] = np.interp(np.flatnonzero(mask), np.flatnonzero(~mask), preds_array[~mask])
-        
     return preds_array
 
 # ==========================================
-# 4. OPTIMIZATION & BANDITS
+# 4. ENSEMBLE LOGIC
 # ==========================================
 class ContextualBanditEnsemble:
     def __init__(self, n_arms, n_features, alpha=0.1):
@@ -421,8 +408,7 @@ class ContextualBanditEnsemble:
         return np.argmax(p)
     def update_all(self, context_vector, rewards):
         for a in range(self.n_arms):
-            self.A[a] += np.outer(context_vector, context_vector)
-            self.b[a] += rewards[a] * context_vector
+            self.A[a] += np.outer(context_vector, context_vector); self.b[a] += rewards[a] * context_vector
 
 def run_contextual_bandits_online(full_preds_df, test_start_date, model_cols, target_col='Actual', features_cols=None):
     print("--- Running Online Contextual Bandits ---")
@@ -433,13 +419,11 @@ def run_contextual_bandits_online(full_preds_df, test_start_date, model_cols, ta
         features_cols = [c for c in possible_feats if c in df.columns]
     n_models = len(model_cols); n_features = len(features_cols) + 1
     bandit = ContextualBanditEnsemble(n_models, n_features, alpha=0.5)
-    
     warmup_start = max(0, test_indices[0] - 60)
     for idx in range(warmup_start, test_indices[0]):
         ctx = np.append(df.loc[idx, features_cols].values.astype(float), 1.0)
         rewards = -np.abs(df.loc[idx, model_cols].values - df.loc[idx, target_col])
         bandit.update_all(ctx, rewards)
-        
     ensemble_preds = []
     for idx in test_indices:
         ctx = np.append(df.loc[idx, features_cols].values.astype(float), 1.0)
@@ -458,7 +442,6 @@ def run_contextual_bandits_rolling(full_preds_df, test_start_date, model_cols, t
         features_cols = [c for c in possible_feats if c in df.columns]
     n_models = len(model_cols); n_features = len(features_cols) + 1
     ensemble_preds = []
-    
     for idx in test_indices:
         target_date = df.loc[idx, 'date']
         data_avail_until = target_date - timedelta(days=2)
@@ -471,7 +454,6 @@ def run_contextual_bandits_rolling(full_preds_df, test_start_date, model_cols, t
             w_df = hist_df.loc[hist_df['date'] >= w_start]
             hist_df = pd.concat([hist_df, w_df, w_df], axis=0)
         if len(hist_df) < 5: hist_df = df.loc[df['date'] <= data_avail_until]
-
         bandit = ContextualBanditEnsemble(n_models, n_features, alpha=0.2)
         X_ctx = np.c_[hist_df[features_cols].values.astype(float), np.ones(len(hist_df))]
         y_act = hist_df[target_col].values
@@ -489,15 +471,13 @@ def solve_weights(X, y, method='frank_wolfe'):
     if method == 'frank_wolfe':
         w = np.ones(n_models) / n_models
         for k in range(500):
-            resid = np.dot(X, w) - y
-            grad = (2/n_samples) * np.dot(X.T, resid)
+            resid = np.dot(X, w) - y; grad = (2/n_samples) * np.dot(X.T, resid)
             s = np.zeros(n_models); s[np.argmin(grad)] = 1.0
             gamma = 2.0 / (k + 2.0); w = (1 - gamma) * w + gamma * s
         return w
     elif method == 'nnls':
-        w, _ = nnls(X, y)
-        if np.sum(w) == 0: return np.ones(n_models) / n_models
-        return w / np.sum(w)
+        w, _ = nnls(X, y); 
+        return w / np.sum(w) if np.sum(w) > 0 else np.ones(n_models) / n_models
     elif method == 'ensemble_selection':
         pool = []
         best_single = np.argmin([mean_squared_error(y, X[:, i]) for i in range(n_models)])
@@ -536,7 +516,6 @@ def get_rolling_weights(full_preds_df, test_start_date, model_cols, target_col='
     return np.array(preds)
 
 def plot_weights_evolution(full_preds_df, test_start_date, model_cols, target_col='Actual', folder='output_graphs', method='frank_wolfe', strategy='month'):
-    print(f"--- Plotting Weights: {method} | {strategy} ---")
     df = full_preds_df.sort_values('date').reset_index(drop=True)
     test_indices = df[df['date'] >= test_start_date].index
     weights_history = []; dates = []
@@ -562,19 +541,19 @@ def plot_weights_evolution(full_preds_df, test_start_date, model_cols, target_co
     plt.title(f'Weights Evolution ({method} | {strategy})', fontsize=16)
     plt.ylabel('Weight', fontsize=12); plt.xlabel('Date', fontsize=12)
     plt.margins(0, 0); plt.tight_layout()
-    filename = f"weights_evolution_{method}_{strategy}.png"
-    plt.savefig(os.path.join(folder, filename), dpi=300); plt.close()
-    csv_filename = f"weights_history_{method}_{strategy}.csv"
-    weights_df.to_csv(os.path.join(CONFIG['output_data'], csv_filename))
+    plt.savefig(os.path.join(folder, f"weights_evolution_{method}_{strategy}.png"), dpi=300); plt.close()
+    weights_df.to_csv(os.path.join(CONFIG['output_data'], f"weights_history_{method}_{strategy}.csv"))
 
 # ==========================================
-# 5. REPORTING
+# 5. REPORTING (NOVÉ: SUBPLOTS)
 # ==========================================
+
 def generate_report(test_df, cols, title, folder, filename):
     metrics = []
+    y_t = test_df['Actual']
     for m in cols:
         if m not in test_df.columns: continue
-        y_t, y_p = test_df['Actual'], test_df[m]
+        y_p = test_df[m]
         metrics.append({
             'Model': m, 
             'MAE': mean_absolute_error(y_t, y_p), 
@@ -585,14 +564,72 @@ def generate_report(test_df, cols, title, folder, filename):
     print(f"\n--- {title} ---")
     print(df_m)
     df_m.to_latex(os.path.join(folder, f"{filename}.tex"), index=False, float_format="%.2f")
+    
     plt.figure(figsize=(14, 7))
     plt.plot(test_df['date'], test_df['Actual'], 'k-', lw=2, label='Actual', alpha=0.8)
     cmap = plt.get_cmap('tab10')
     for i, c in enumerate(cols):
         if c in test_df.columns:
             plt.plot(test_df['date'], test_df[c], ls='--', alpha=0.7, label=c, color=cmap(i))
-    plt.title(title); plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
-    plt.savefig(os.path.join(folder, f"{filename}.png"), dpi=300); plt.close()
+    plt.title(title)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(folder, f"{filename}.png"), dpi=300)
+    plt.close()
+
+def generate_grouped_report(test_df, model_cols, folder):
+    # Definice skupin
+    groups = {
+        "Tree Models": ['XGBoost', 'LightGBM', 'CatBoost', 'ExtraTrees'],
+        "Deep Learning": ['TFT', 'N-HiTS', 'NeuralProphet', 'LSTM'],
+        "Statistical": ['Prophet', 'SARIMAX', 'TBATS'],
+        "Classical ML": ['SVR', 'ElasticNet', 'KNN', 'BayesianRidge']
+    }
+    
+    # 1. Tabulka metrik
+    metrics = []
+    y_true = test_df['Actual']
+    for m in model_cols:
+        if m not in test_df.columns: continue
+        y_p = test_df[m]
+        metrics.append({
+            'Model': m, 
+            'MAE': mean_absolute_error(y_true, y_p), 
+            'RMSE': np.sqrt(mean_squared_error(y_true, y_p)), 
+            'MAPE': np.mean(np.abs((y_true - y_p) / y_true)) * 100
+        })
+    df_m = pd.DataFrame(metrics).sort_values('MAPE')
+    print("\n--- Final Model Leaderboard ---")
+    print(df_m)
+    df_m.to_csv(os.path.join(folder, "final_leaderboard.csv"), index=False)
+    
+    # 2. Subplots (2x2)
+    fig, axes = plt.subplots(2, 2, figsize=(20, 12), sharex=True)
+    axes = axes.flatten()
+    
+    for i, (grp_name, models) in enumerate(groups.items()):
+        ax = axes[i]
+        ax.plot(test_df['date'], test_df['Actual'], 'k-', lw=1.5, label='Actual', alpha=0.6)
+        
+        # Color cycle
+        colors = plt.cm.tab10(np.linspace(0, 1, len(models)))
+        
+        for j, m in enumerate(models):
+            if m in test_df.columns:
+                # Calculate MAPE for label
+                mape = np.mean(np.abs((y_true - test_df[m]) / y_true)) * 100
+                ax.plot(test_df['date'], test_df[m], ls='--', lw=1.5, label=f"{m} ({mape:.1f}%)", color=colors[j])
+        
+        ax.set_title(grp_name, fontsize=14, fontweight='bold')
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+        if i >= 2: ax.set_xlabel("Date")
+        if i % 2 == 0: ax.set_ylabel("Gas Consumption")
+        
+    plt.tight_layout()
+    plt.savefig(os.path.join(folder, "report_base_models_grouped.png"), dpi=300)
+    plt.close()
 
 def main():
     df = prepare_dataset()
@@ -607,70 +644,57 @@ def main():
     X_train = train_df[feats].values; y_train = train_df[target].values
     X_val = val_df[feats].values; y_val = val_df[target].values
     X_test = test_df[feats].values
-    
     scaler = StandardScaler()
-    X_train_sc = scaler.fit_transform(X_train)
-    X_val_sc = scaler.transform(X_val)
-    X_test_sc = scaler.transform(X_test)
+    X_train_sc = scaler.fit_transform(X_train); X_val_sc = scaler.transform(X_val); X_test_sc = scaler.transform(X_test)
     
     full_preds = pd.concat([val_df, test_df])[['date', target]].copy()
-    full_preds.rename(columns={target: 'Actual'}, inplace=True)
-    full_preds.reset_index(drop=True, inplace=True)
-    
+    full_preds.rename(columns={target: 'Actual'}, inplace=True); full_preds.reset_index(drop=True, inplace=True)
     def predict_all(model, is_scaled=False):
         p_val = model.predict(X_val_sc) if is_scaled else model.predict(X_val)
         p_test = model.predict(X_test_sc) if is_scaled else model.predict(X_test)
         return np.concatenate([p_val, p_test])
 
-    print("\n--- Training Base Models ---")
-    m_xgb = optimize_model('XGBoost', X_train, y_train, X_val, y_val, CONFIG['hyperopt_evals'])
-    full_preds['XGBoost'] = predict_all(m_xgb)
-    
-    m_lgbm = optimize_model('LightGBM', X_train, y_train, X_val, y_val, CONFIG['hyperopt_evals'])
-    full_preds['LightGBM'] = predict_all(m_lgbm)
-    
+    print("\n--- Training Models ---")
+    # Tree
+    for m in ['XGBoost', 'LightGBM', 'ExtraTrees']:
+        mod = optimize_model(m, X_train, y_train, X_val, y_val, CONFIG['hyperopt_evals'])
+        full_preds[m] = predict_all(mod)
     if CATBOOST_AVAILABLE:
-        m_cat = optimize_model('CatBoost', X_train, y_train, X_val, y_val, CONFIG['hyperopt_evals'])
-        full_preds['CatBoost'] = predict_all(m_cat)
+        mod = optimize_model('CatBoost', X_train, y_train, X_val, y_val, CONFIG['hyperopt_evals'])
+        full_preds['CatBoost'] = predict_all(mod)
         
-    m_svr = optimize_model('SVR', X_train_sc, y_train, X_val_sc, y_val, CONFIG['hyperopt_evals'])
-    full_preds['SVR'] = predict_all(m_svr, is_scaled=True)
+    # Classical
+    for m in ['KNN', 'SVR']:
+        mod = optimize_model(m, X_train_sc, y_train, X_val_sc, y_val, CONFIG['hyperopt_evals'])
+        full_preds[m] = predict_all(mod, is_scaled=True)
+    enet = ElasticNet(alpha=0.1); enet.fit(X_train_sc, y_train); full_preds['ElasticNet'] = predict_all(enet, is_scaled=True)
+    bay = BayesianRidge(); bay.fit(X_train_sc, y_train); full_preds['BayesianRidge'] = predict_all(bay, is_scaled=True) # NOVÉ
     
-    m_knn = optimize_model('KNN', X_train_sc, y_train, X_val_sc, y_val, CONFIG['hyperopt_evals'])
-    full_preds['KNN'] = predict_all(m_knn, is_scaled=True)
-    
-    m_et = optimize_model('ExtraTrees', X_train, y_train, X_val, y_val, CONFIG['hyperopt_evals'])
-    full_preds['ExtraTrees'] = predict_all(m_et)
-    
-    enet = ElasticNet(alpha=0.1); enet.fit(X_train_sc, y_train)
-    full_preds['ElasticNet'] = predict_all(enet, is_scaled=True)
-    
-    p_val_lstm = train_lstm(X_train_sc, y_train, X_val_sc, X_train.shape[1])
-    p_test_lstm = train_lstm(X_train_sc, y_train, X_test_sc, X_train.shape[1])
-    full_preds['LSTM'] = np.concatenate([p_val_lstm, p_test_lstm])
-    
+    # DL & Stats
+    full_preds['LSTM'] = np.concatenate([train_lstm(X_train_sc, y_train, X_val_sc, X_train.shape[1]), train_lstm(X_train_sc, y_train, X_test_sc, X_train.shape[1])])
     if PROPHET_AVAILABLE:
         p_df = train_df[['date', target, 'is_working_day', 'temperature_2m']].rename(columns={'date':'ds', target:'y'})
         m = Prophet(); m.add_regressor('is_working_day'); m.add_regressor('temperature_2m'); m.fit(p_df)
         fut = pd.concat([val_df, test_df])[['date', 'is_working_day', 'temperature_2m']].rename(columns={'date':'ds'})
         full_preds['Prophet'] = m.predict(fut)['yhat'].values
-        
     if NEURALPROPHET_AVAILABLE:
-        np_preds = run_neural_prophet(df, val_start, target) # Posíláme celý df a split date
-        if np_preds is not None and len(np_preds) == len(full_preds):
-            full_preds['NeuralProphet'] = np_preds
-        
-    if SARIMAX_AVAILABLE:
-        print("9. SARIMAX (Fixed)...")
-        full_preds['SARIMAX'] = train_sarimax(y_train, X_train, X_val, X_test)
+        np_p = run_neural_prophet(df, val_start, target)
+        if np_p is not None and len(np_p) == len(full_preds): full_preds['NeuralProphet'] = np_p
+    if SARIMAX_AVAILABLE: full_preds['SARIMAX'] = train_sarimax(y_train, X_train, X_val, X_test)
+    if TBATS_AVAILABLE: 
+        # TBATS needs only Y history and forecast length
+        print("  -> Fitting TBATS...")
+        # Fit on train, forecast Val+Test
+        tb_mod = TBATS(seasonal_periods=[7, 365.25]).fit(y_train)
+        full_preds['TBATS'] = tb_mod.forecast(steps=len(full_preds))
 
     if TFT_AVAILABLE:
-        tft_preds = run_deep_model(df, val_start, target, model_type='TFT', max_epochs=CONFIG['tft_epochs'])
-        if len(tft_preds) == len(full_preds): full_preds['TFT'] = tft_preds
-        
-        nhits_preds = run_deep_model(df, val_start, target, model_type='N-HiTS', max_epochs=CONFIG['tft_epochs'])
-        if len(nhits_preds) == len(full_preds): full_preds['N-HiTS'] = nhits_preds
+        tft = run_deep_model(df, val_start, target, 'TFT', CONFIG['tft_epochs'])
+        if len(tft) == len(full_preds): full_preds['TFT'] = tft
+        nhits = run_deep_model(df, val_start, target, 'N-HiTS', CONFIG['tft_epochs'])
+        if len(nhits) == len(full_preds): full_preds['N-HiTS'] = nhits
 
+    # Ensemble
     print("\n--- Generating Ensembles ---")
     model_cols = [c for c in full_preds.columns if c not in ['date', 'Actual']]
     test_res = full_preds[full_preds['date'] >= test_start].copy()
@@ -678,26 +702,24 @@ def main():
     
     methods = ['frank_wolfe', 'nnls', 'ensemble_selection']
     windows = [('week', 'a_Last_Week'), ('month', 'b_Last_Month'), ('weighted_month', 'c_Weighted_Month')]
-    
     for method in methods:
         for strat, label in windows:
-            col_name = f"{method}_{label}"
-            test_res[col_name] = get_rolling_weights(full_preds, test_start, model_cols, strategy=strat, method=method)
+            test_res[f"{method}_{label}"] = get_rolling_weights(full_preds, test_start, model_cols, strategy=strat, method=method)
 
     test_res['Bandit_Online'] = run_contextual_bandits_online(full_preds, test_start, model_cols, target_col='Actual')
     for strat in ['week', 'month', 'weighted_month']:
-        col_name = f"Bandit_Rolling_{strat}"
-        test_res[col_name] = run_contextual_bandits_rolling(full_preds, test_start, model_cols, target_col='Actual', strategy=strat)
+        test_res[f"Bandit_Rolling_{strat}"] = run_contextual_bandits_rolling(full_preds, test_start, model_cols, target_col='Actual', strategy=strat)
 
+    # Reporting
     out_dir = CONFIG['output_graphs']
-    generate_report(test_res, model_cols, "Prediction Models Performance", out_dir, "report_1_base_models")
+    # 1. Nový Grouped Report (Subplots)
+    generate_grouped_report(test_res, model_cols, out_dir)
     
-    for label, title in [('Last_Week', 'Ensemble Opt: a) Last Week Data'),
-                         ('Last_Month', 'Ensemble Opt: b) Last Month Data'),
-                         ('Weighted_Month', 'Ensemble Opt: c) Weighted Month')]:
+    # 2. Ensemble Reports
+    for label, title in [('Last_Week', 'Last Week Data'), ('Last_Month', 'Last Month Data'), ('Weighted_Month', 'Weighted Month')]:
         cols = [c for c in test_res.columns if label in c] + ['Ensemble_Avg']
-        generate_report(test_res, cols, title, out_dir, f"report_2_{label.lower()}")
-
+        generate_report(test_res, cols, f"Ensemble Opt: {title}", out_dir, f"report_2_{label.lower()}")
+        
     bandit_cols = [c for c in test_res.columns if 'Bandit' in c] + ['Ensemble_Avg']
     generate_report(test_res, bandit_cols, "Contextual Bandits Comparison", out_dir, "report_3_bandits")
 
@@ -706,7 +728,15 @@ def main():
             plot_weights_evolution(full_preds, test_start, model_cols, target_col='Actual', folder=out_dir, method=method, strategy=strat)
 
     test_res.to_csv(os.path.join(CONFIG['output_data'], 'final_results_complete.csv'), index=False)
-    print(f"\nAll Done. Reports saved to {out_dir}")
+    print(f"\nAll Done. Results in {out_dir}")
 
 if __name__ == "__main__":
+    start_time = time.time()
+    print(f"\n--- Script execution started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+
     main()
+
+    end_time = time.time()
+    duration = end_time - start_time
+    print(f"--- Script execution finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
+    print(f"Total execution time: {duration/60:.2f} minutes ({duration:.2f} seconds)")

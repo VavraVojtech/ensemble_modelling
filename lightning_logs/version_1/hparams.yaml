@@ -1,4 +1,4 @@
-attention_head_size: 1
+attention_head_size: 4
 categorical_groups: {}
 causal_attention: true
 dataset_parameters:
@@ -42,7 +42,7 @@ dataset_parameters:
       warn: true
     group_id: !!python/object:pytorch_forecasting.data.encoders.NaNLabelEncoder
       add_nan: false
-      classes_:
+      classes_: &id006
         CZ: 0
       classes_vector_: !!python/object/apply:numpy.core.multiarray._reconstruct
         args:
@@ -74,40 +74,6 @@ dataset_parameters:
           QwAAAFoAAAA=
       warn: true
     is_holiday: !!python/object:pytorch_forecasting.data.encoders.NaNLabelEncoder
-      add_nan: false
-      classes_: &id006
-        '0': 0
-        '1': 1
-      classes_vector_: !!python/object/apply:numpy.core.multiarray._reconstruct
-        args:
-        - *id001
-        - !!python/tuple
-          - 0
-        - !!binary |
-          Yg==
-        state: !!python/tuple
-        - 1
-        - !!python/tuple
-          - 2
-        - !!python/object/apply:numpy.dtype
-          args:
-          - U1
-          - false
-          - true
-          state: !!python/tuple
-          - 3
-          - <
-          - null
-          - null
-          - null
-          - 4
-          - 4
-          - 8
-        - false
-        - !!binary |
-          MAAAADEAAAA=
-      warn: true
-    is_weekend: !!python/object:pytorch_forecasting.data.encoders.NaNLabelEncoder
       add_nan: false
       classes_: &id007
         '0': 0
@@ -141,7 +107,7 @@ dataset_parameters:
         - !!binary |
           MAAAADEAAAA=
       warn: true
-    is_working_day: !!python/object:pytorch_forecasting.data.encoders.NaNLabelEncoder
+    is_weekend: !!python/object:pytorch_forecasting.data.encoders.NaNLabelEncoder
       add_nan: false
       classes_: &id008
         '0': 0
@@ -175,6 +141,85 @@ dataset_parameters:
         - !!binary |
           MAAAADEAAAA=
       warn: true
+    is_working_day: !!python/object:pytorch_forecasting.data.encoders.NaNLabelEncoder
+      add_nan: false
+      classes_: &id009
+        '0': 0
+        '1': 1
+      classes_vector_: !!python/object/apply:numpy.core.multiarray._reconstruct
+        args:
+        - *id001
+        - !!python/tuple
+          - 0
+        - !!binary |
+          Yg==
+        state: !!python/tuple
+        - 1
+        - !!python/tuple
+          - 2
+        - !!python/object/apply:numpy.dtype
+          args:
+          - U1
+          - false
+          - true
+          state: !!python/tuple
+          - 3
+          - <
+          - null
+          - null
+          - null
+          - 4
+          - 4
+          - 8
+        - false
+        - !!binary |
+          MAAAADEAAAA=
+      warn: true
+    month: !!python/object:pytorch_forecasting.data.encoders.NaNLabelEncoder
+      add_nan: false
+      classes_: &id010
+        '1': 0
+        '10': 1
+        '11': 2
+        '12': 3
+        '2': 4
+        '3': 5
+        '4': 6
+        '5': 7
+        '6': 8
+        '7': 9
+        '8': 10
+        '9': 11
+      classes_vector_: !!python/object/apply:numpy.core.multiarray._reconstruct
+        args:
+        - *id001
+        - !!python/tuple
+          - 0
+        - !!binary |
+          Yg==
+        state: !!python/tuple
+        - 1
+        - !!python/tuple
+          - 12
+        - !!python/object/apply:numpy.dtype
+          args:
+          - U2
+          - false
+          - true
+          state: !!python/tuple
+          - 3
+          - <
+          - null
+          - null
+          - null
+          - 8
+          - 4
+          - 8
+        - false
+        - !!binary |
+          MQAAAAAAAAAxAAAAMAAAADEAAAAxAAAAMQAAADIAAAAyAAAAAAAAADMAAAAAAAAANAAAAAAAAAA1
+          AAAAAAAAADYAAAAAAAAANwAAAAAAAAA4AAAAAAAAADkAAAAAAAAA
+      warn: true
   constant_fill_strategy: null
   group_ids:
   - group_id
@@ -187,7 +232,7 @@ dataset_parameters:
   predict_mode: false
   randomize_length: null
   scalers:
-    cos_year: !!python/object:sklearn.preprocessing._data.StandardScaler
+    day_of_year: !!python/object:sklearn.preprocessing._data.StandardScaler
       _sklearn_version: 1.2.2
       copy: true
       feature_names_in_: !!python/object/apply:numpy.core.multiarray._reconstruct
@@ -216,7 +261,7 @@ dataset_parameters:
           - -1
           - 63
         - false
-        - - cos_year
+        - - day_of_year
       mean_: !!python/object/apply:numpy.core.multiarray._reconstruct
         args:
         - *id001
@@ -244,7 +289,7 @@ dataset_parameters:
           - 0
         - false
         - !!binary |
-          xSuZ7PVMjr8=
+          3SQGgZUPZ0A=
       n_features_in_: 1
       n_samples_seen_: !!python/object/apply:numpy.core.multiarray.scalar
       - &id004 !!python/object/apply:numpy.dtype
@@ -261,75 +306,6 @@ dataset_parameters:
         - -1
         - -1
         - 0
-      - !!binary |
-        uAsAAAAAAAA=
-      scale_: !!python/object/apply:numpy.core.multiarray._reconstruct
-        args:
-        - *id001
-        - !!python/tuple
-          - 0
-        - !!binary |
-          Yg==
-        state: !!python/tuple
-        - 1
-        - !!python/tuple
-          - 1
-        - *id002
-        - false
-        - !!binary |
-          GNNeNeWR5j8=
-      var_: !!python/object/apply:numpy.core.multiarray._reconstruct
-        args:
-        - *id001
-        - !!python/tuple
-          - 0
-        - !!binary |
-          Yg==
-        state: !!python/tuple
-        - 1
-        - !!python/tuple
-          - 1
-        - *id002
-        - false
-        - !!binary |
-          oKP/qWjW3z8=
-      with_mean: true
-      with_std: true
-    day_of_year: !!python/object:sklearn.preprocessing._data.StandardScaler
-      _sklearn_version: 1.2.2
-      copy: true
-      feature_names_in_: !!python/object/apply:numpy.core.multiarray._reconstruct
-        args:
-        - *id001
-        - !!python/tuple
-          - 0
-        - !!binary |
-          Yg==
-        state: !!python/tuple
-        - 1
-        - !!python/tuple
-          - 1
-        - *id003
-        - false
-        - - day_of_year
-      mean_: !!python/object/apply:numpy.core.multiarray._reconstruct
-        args:
-        - *id001
-        - !!python/tuple
-          - 0
-        - !!binary |
-          Yg==
-        state: !!python/tuple
-        - 1
-        - !!python/tuple
-          - 1
-        - *id002
-        - false
-        - !!binary |
-          3SQGgZUPZ0A=
-      n_features_in_: 1
-      n_samples_seen_: !!python/object/apply:numpy.core.multiarray.scalar
-      - *id004
       - !!binary |
         uAsAAAAAAAA=
       scale_: !!python/object/apply:numpy.core.multiarray._reconstruct
@@ -502,7 +478,7 @@ dataset_parameters:
           AAAAAAAAAAA=
       with_mean: true
       with_std: true
-    sin_year: !!python/object:sklearn.preprocessing._data.StandardScaler
+    target_scaled_center: !!python/object:sklearn.preprocessing._data.StandardScaler
       _sklearn_version: 1.2.2
       copy: true
       feature_names_in_: !!python/object/apply:numpy.core.multiarray._reconstruct
@@ -518,7 +494,7 @@ dataset_parameters:
           - 1
         - *id003
         - false
-        - - sin_year
+        - - target_scaled_center
       mean_: !!python/object/apply:numpy.core.multiarray._reconstruct
         args:
         - *id001
@@ -533,76 +509,7 @@ dataset_parameters:
         - *id002
         - false
         - !!binary |
-          hCnEX6x3k78=
-      n_features_in_: 1
-      n_samples_seen_: !!python/object/apply:numpy.core.multiarray.scalar
-      - *id004
-      - !!binary |
-        uAsAAAAAAAA=
-      scale_: !!python/object/apply:numpy.core.multiarray._reconstruct
-        args:
-        - *id001
-        - !!python/tuple
-          - 0
-        - !!binary |
-          Yg==
-        state: !!python/tuple
-        - 1
-        - !!python/tuple
-          - 1
-        - *id002
-        - false
-        - !!binary |
-          X/AdZfOr5j8=
-      var_: !!python/object/apply:numpy.core.multiarray._reconstruct
-        args:
-        - *id001
-        - !!python/tuple
-          - 0
-        - !!binary |
-          Yg==
-        state: !!python/tuple
-        - 1
-        - !!python/tuple
-          - 1
-        - *id002
-        - false
-        - !!binary |
-          ciONowoQ4D8=
-      with_mean: true
-      with_std: true
-    spotreba_cr_center: !!python/object:sklearn.preprocessing._data.StandardScaler
-      _sklearn_version: 1.2.2
-      copy: true
-      feature_names_in_: !!python/object/apply:numpy.core.multiarray._reconstruct
-        args:
-        - *id001
-        - !!python/tuple
-          - 0
-        - !!binary |
-          Yg==
-        state: !!python/tuple
-        - 1
-        - !!python/tuple
-          - 1
-        - *id003
-        - false
-        - - spotreba_cr_center
-      mean_: !!python/object/apply:numpy.core.multiarray._reconstruct
-        args:
-        - *id001
-        - !!python/tuple
-          - 0
-        - !!binary |
-          Yg==
-        state: !!python/tuple
-        - 1
-        - !!python/tuple
-          - 1
-        - *id002
-        - false
-        - !!binary |
-          F2lHTqF3KEA=
+          32suJE0p5jw=
       n_features_in_: 1
       n_samples_seen_: !!python/object/apply:numpy.core.multiarray.scalar
       - *id004
@@ -640,7 +547,7 @@ dataset_parameters:
           AAAAAAAAAAA=
       with_mean: true
       with_std: true
-    spotreba_cr_scale: !!python/object:sklearn.preprocessing._data.StandardScaler
+    target_scaled_scale: !!python/object:sklearn.preprocessing._data.StandardScaler
       _sklearn_version: 1.2.2
       copy: true
       feature_names_in_: !!python/object/apply:numpy.core.multiarray._reconstruct
@@ -656,7 +563,7 @@ dataset_parameters:
           - 1
         - *id003
         - false
-        - - spotreba_cr_scale
+        - - target_scaled_scale
       mean_: !!python/object/apply:numpy.core.multiarray._reconstruct
         args:
         - *id001
@@ -671,7 +578,7 @@ dataset_parameters:
         - *id002
         - false
         - !!binary |
-          uVjYeZHI4D8=
+          0Dpuzq4E8D8=
       n_features_in_: 1
       n_samples_seen_: !!python/object/apply:numpy.core.multiarray.scalar
       - *id004
@@ -916,10 +823,11 @@ dataset_parameters:
           VVVV1V/jJkE=
       with_mean: true
       with_std: true
-  static_categoricals: null
+  static_categoricals:
+  - group_id
   static_reals: null
-  target: spotreba_cr
-  target_normalizer: &id009 !!python/object:pytorch_forecasting.data.encoders.GroupNormalizer
+  target: target_scaled
+  target_normalizer: &id011 !!python/object:pytorch_forecasting.data.encoders.GroupNormalizer
     _groups:
     - group_id
     _method_kwargs: {}
@@ -929,8 +837,8 @@ dataset_parameters:
     method: standard
     method_kwargs: {}
     missing_:
-      center: 12.233652540413955
-      scale: 0.5244834308421311
+      center: 2.4604022523059638e-15
+      scale: 1.0011432708449104
     norm_: !!python/object:pandas.core.frame.DataFrame
       _flags:
         allows_duplicate_labels: true
@@ -953,7 +861,7 @@ dataset_parameters:
             - *id002
             - false
             - !!binary |
-              F2lHTqF3KEC6WNh5kcjgPw==
+              3WsuJE0p5jzSOm7OrgTwPw==
           - !!python/object/apply:builtins.slice
             - 0
             - 2
@@ -1011,31 +919,35 @@ dataset_parameters:
       _typ: dataframe
       attrs: {}
     scale_by_group: false
-    transformation: softplus
+    transformation: null
   time_idx: time_idx
   time_varying_known_categoricals:
   - is_weekend
   - is_working_day
   - is_holiday
+  - month
   time_varying_known_reals:
   - time_idx
   - day_of_year
-  - sin_year
-  - cos_year
   - temperature_2m
   - temp_effective
   time_varying_unknown_categoricals: null
   time_varying_unknown_reals:
-  - spotreba_cr
+  - target_scaled
   variable_groups: null
   weight: null
 dropout: 0.1
 embedding_labels:
-  is_holiday: *id006
-  is_weekend: *id007
-  is_working_day: *id008
+  group_id: *id006
+  is_holiday: *id007
+  is_weekend: *id008
+  is_working_day: *id009
+  month: *id010
 embedding_paddings: []
 embedding_sizes:
+  group_id: !!python/tuple
+  - 1
+  - 1
   is_holiday: !!python/tuple
   - 2
   - 1
@@ -1045,10 +957,13 @@ embedding_sizes:
   is_working_day: !!python/tuple
   - 2
   - 1
-hidden_continuous_size: 8
+  month: !!python/tuple
+  - 12
+  - 6
+hidden_continuous_size: 16
 hidden_continuous_sizes: {}
-hidden_size: 16
-learning_rate: 0.03
+hidden_size: 64
+learning_rate: 0.005
 log_gradient_flow: false
 log_interval: -1
 log_val_interval: null
@@ -1060,55 +975,54 @@ monotone_constraints: {}
 optimizer: adam
 optimizer_params: null
 output_size: 7
-output_transformer: *id009
+output_transformer: *id011
 reduce_on_plateau_min_lr: 1.0e-05
 reduce_on_plateau_patience: 1000
 reduce_on_plateau_reduction: 2.0
 share_single_variable_networks: false
-static_categoricals: []
+static_categoricals:
+- group_id
 static_reals:
 - encoder_length
-- spotreba_cr_center
-- spotreba_cr_scale
+- target_scaled_center
+- target_scaled_scale
 time_varying_categoricals_decoder:
 - is_weekend
 - is_working_day
 - is_holiday
+- month
 time_varying_categoricals_encoder:
 - is_weekend
 - is_working_day
 - is_holiday
+- month
 time_varying_reals_decoder:
 - time_idx
 - day_of_year
-- sin_year
-- cos_year
 - temperature_2m
 - temp_effective
 - relative_time_idx
 time_varying_reals_encoder:
 - time_idx
 - day_of_year
-- sin_year
-- cos_year
 - temperature_2m
 - temp_effective
 - relative_time_idx
-- spotreba_cr
+- target_scaled
 weight_decay: 0.0
 x_categoricals:
+- group_id
 - is_weekend
 - is_working_day
 - is_holiday
+- month
 x_reals:
 - encoder_length
-- spotreba_cr_center
-- spotreba_cr_scale
+- target_scaled_center
+- target_scaled_scale
 - time_idx
 - day_of_year
-- sin_year
-- cos_year
 - temperature_2m
 - temp_effective
 - relative_time_idx
-- spotreba_cr
+- target_scaled
