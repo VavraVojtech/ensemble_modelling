@@ -80,8 +80,8 @@ CONFIG = {
     'split_val_date': '2024-10-01',   
     'target_col': 'spotreba_cr',
     'seed': 42,
-    'hyperopt_evals': 50,             
-    'tft_epochs': 50,
+    'hyperopt_evals': 100,             
+    'tft_epochs': 100,
     'fw_iterations': 500 # Explicitní parametr pro Frank-Wolfe
 }
 
