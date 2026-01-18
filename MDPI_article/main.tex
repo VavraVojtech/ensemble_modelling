@@ -1,0 +1,349 @@
+%  LaTeX support: latex@mdpi.com 
+%  For support, please attach all files needed for compiling as well as the log file, and specify your operating system, LaTeX version, and LaTeX editor.
+
+%=================================================================
+% UNCOMMENT THE FOLLOWING LINE FOR PRODUCTION WITH mdpi.cls:
+\documentclass[journal,article,submit,pdftex,moreauthors]{Definitions/mdpi} 
+
+%=================================================================
+% MDPI internal commands
+\firstpage{1} 
+\makeatletter 
+\setcounter{page}{\@firstpage} 
+\makeatother
+\pubvolume{1}
+\issuenum{1}
+\articlenumber{0}
+\pubyear{2025}
+\copyrightyear{2025}
+\datereceived{ } 
+\daterevised{ } 
+\dateaccepted{ } 
+\datepublished{ } 
+\hreflink{https://doi.org/} 
+
+%=================================================================
+% Add packages and commands here.
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs} 
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{bm} 
+\usepackage{url}
+\usepackage{float}
+
+%=================================================================
+% Full title of the paper (Capitalized)
+\Title{Adaptive Ensemble Weight Optimization for Natural Gas Consumption Forecasting: A Hybrid Stochastic-Deep Learning Framework Applied to the Czech Market}
+
+% Authors
+\Author{Josef Jablonsky $^{1}$ and Vojtěch Vávra $^{1}$*}
+
+% Affiliations
+\address{%
+$^{1}$ \quad Department of Econometrics, University of Economics and Business, Prague, Czech Republic}
+
+% Contact information
+\corres{Correspondence: jablon@vse.cz}
+
+% Abstract
+\abstract{The transition towards data-driven energy management necessitates advanced predictive frameworks capable of handling the non-linear and non-stationary nature of natural gas consumption. This study addresses the challenge of creating a robust meta-learner for daily gas consumption forecasting in the Czech Republic. Moving beyond simple model averaging, we formulate the ensemble weighting problem as a constrained convex optimization task on a unit simplex. We propose and evaluate a rigorous methodology utilizing the Frank-Wolfe algorithm (Conditional Gradient) and Ensemble Selection to dynamically optimize weights of a heterogeneous set of base learners, including SARIMAX, XGBoost, N-HiTS, and Temporal Fusion Transformers (TFT). The study is supported by a comprehensive feature engineering pipeline utilizing regulatory data from the Market Operator (OTE). Our results demonstrate that mathematically rigorous weight optimization (MAPE 4.43\%) significantly outperforms both individual state-of-the-art models (TFT 5.21\%) and static averaging (6.90\%), offering a direct operational advantage for balancing market participation. We specifically validate a "Recency-Weighted" heuristic, demonstrating its robustness compared to standard exponential decay schemes.}
+
+% Keywords
+\keyword{Natural Gas Forecasting; Operations Research; Convex Optimization; Frank-Wolfe Algorithm; Ensemble Learning; Deep Learning; Czech Energy Market} 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{document}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Introduction}
+
+The accurate forecasting of natural gas consumption is a cornerstone of energy security and economic efficiency, particularly in countries with high import dependence and seasonal demand variability like the Czech Republic. While individual machine learning (ML) architectures—ranging from Gradient Boosting Machines (GBM) \citep{ref_xgboost} to Recurrent Neural Networks (RNN)—have shown promise, single-model approaches often lack robustness against regime shifts, such as sudden weather anomalies or geopolitical shocks.
+
+This paper shifts the research focus from the development of individual predictors to the \textit{operational research} problem of optimal forecast combination. We hypothesize that the daily prediction task can be modeled as a decision-making process where a meta-learner assigns weights to a portfolio of diverse algorithms.
+
+The contribution of this study is threefold:
+\begin{enumerate}
+    \item \textbf{Mathematical Formulation:} We frame the ensemble weighting problem as a constrained convex optimization task on a simplex, minimizing a regularized loss function that reflects the asymmetry of balancing costs \citep{ref_boyd}.
+    \item \textbf{Algorithmic Solution:} We apply the Frank-Wolfe algorithm \citep{ref_fw_jaggi} and Ensemble Selection methods \citep{ref_caruana} to solve this optimization problem efficiently in a rolling-window production environment.
+    \item \textbf{Empirical Validation:} We provide a comprehensive validation on real-world Czech gas consumption data, explicitly comparing our "Recency-Weighted" heuristic against standard exponential decay and identifying the optimal memory length.
+\end{enumerate}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Materials and Methods}
+
+The methodology is designed as a modular pipeline implemented in Python 3.11, utilizing libraries such as \texttt{pandas} for data manipulation, \texttt{pytorch} \citep{ref_pytorch} for deep learning models, and custom solvers for optimization tasks.
+
+\subsection{Data Engineering and Feature Selection}
+The primary dataset consists of daily gas consumption series in the Czech Republic, sourced from the Market Operator (OTE, a.s.) \citep{ref_ote}. Weather data (temperature, wind speed) were obtained via the Open-Meteo API \citep{ref_openmeteo}, utilizing the ERA5 reanalysis model for historical data. To ensure spatial representativeness for the entire Czech Republic, we aggregated data from the geographic centroids of all administrative districts (okresy). The daily values were resampled to align with the "Gas Day" convention (06:00 AM to 06:00 AM next day).
+
+A critical preprocessing step, mandated by the regulatory framework, is the calculation of Effective Temperature ($T_{eff}$). Unlike raw air temperature, $T_{eff}$ accounts for the thermal inertia of buildings. We implement the recursive filter defined by OTE:
+\begin{equation}
+    T_{eff, t} = 0.5 \cdot T_t + 0.5 \cdot T_{eff, t-1}
+\end{equation}
+Additional engineered features include:
+\begin{itemize}
+    \item \textbf{Calendar Features:} Boolean flags for weekends and public holidays (using the \texttt{holidays} library for CZ), and cyclical encodings ($\sin \frac{2\pi d}{365}, \cos \frac{2\pi d}{365}$) of the day of year.
+    \item \textbf{Lagged Variables:} Consumption lags ($t-1, t-2, t-7, t-14$) to capture short-term and weekly autoregressive properties.
+    \item \textbf{Rolling Statistics:} 3-day and 7-day moving averages of temperature and wind speed to smooth out weather volatility.
+\end{itemize}
+
+As shown in Figure \ref{fig:feature_importance}, Ridge Regression coefficients confirm that effective temperature and immediate consumption history are the most significant linear predictors. The negative coefficient for temperature confirms the inverse relationship with heating demand.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\textwidth]{feature_importance_ridge.png}
+\caption{Feature Importance derived from Ridge Regression coefficients. The magnitude indicates the strength of the linear relationship. Effective temperature (negative coefficient) and recent consumption lags (positive coefficients) are the dominant drivers.}
+\label{fig:feature_importance}
+\end{figure}
+
+\subsection{Base Learners (The Ensemble)}
+We employ a heterogeneous set of 15 algorithms to ensure error independence and diversity:
+
+\subsubsection{Tree-Based Ensembles}
+We utilized \textbf{XGBoost} \citep{ref_xgboost}, \textbf{LightGBM} \citep{ref_lgbm}, \textbf{CatBoost} \citep{ref_catboost}, and \textbf{ExtraTrees} \citep{ref_scikit}. These models are robust to outliers and capable of modeling non-linear interactions. Hyperparameters were tuned using the Tree-structured Parzen Estimator (TPE) algorithm.
+
+\subsubsection{Deep Learning Architectures}
+\begin{itemize}
+    \item \textbf{LSTM (Long Short-Term Memory):} Recurrent networks designed to capture temporal dependencies \citep{ref_pytorch}.
+    \item \textbf{TFT (Temporal Fusion Transformer):} An attention-based architecture proposed by \citet{ref_tft} that provides interpretability and explicitly handles static (location) and dynamic (time) covariates.
+    \item \textbf{N-HiTS (Neural Hierarchical Interpolation for Time Series):} A state-of-the-art model by \citet{ref_nhits} using hierarchical interpolation for long-range dependencies.
+    \item \textbf{NeuralProphet:} A hybrid model bridging statistical and deep learning approaches, based on PyTorch \citep{ref_pytorch}.
+\end{itemize}
+
+\subsubsection{Statistical and Econometric Models}
+To provide a robust baseline, we included \textbf{SARIMAX} (Seasonal AutoRegressive Integrated Moving Average with eXogenous factors) and \textbf{Prophet} \citep{ref_prophet}. Additionally, a robust \textbf{ARX} model (AutoRegression with Exogenous variables) was implemented using the SARIMAX backend to handle structural breaks.
+
+\subsubsection{Classical Machine Learning}
+We further diversified the pool with classical algorithms implemented via Scikit-learn \citep{ref_scikit}:
+\begin{itemize}
+    \item \textbf{SVR (Support Vector Regression):} Effective in high-dimensional spaces.
+    \item \textbf{ElasticNet:} A regularized regression method combining L1 and L2 penalties.
+    \item \textbf{Bayesian Ridge:} Probabilistic approach to linear regression.
+    \item \textbf{KNN (K-Nearest Neighbors):} A non-parametric method based on feature similarity.
+\end{itemize}
+
+\subsection{Optimization Framework: The Frank-Wolfe Algorithm}
+The core technical innovation is the dynamic weighting mechanism. Let $\hat{y}_{i,t}$ be the prediction of model $i$ at time $t$, and $y_t$ be the actual consumption. We seek a weight vector $\mathbf{w} \in \mathbb{R}^N$ that minimizes the loss function $\mathcal{L}$ over a historical window $H$.
+
+The optimization problem is defined as:
+\begin{align}
+    \min_{\mathbf{w}} \quad & f(\mathbf{w}) = \frac{1}{H} \sum_{t=1}^H \mathcal{L}\left(y_t, \sum_{i=1}^N w_i \hat{y}_{i,t}\right) \\
+    \text{s.t.} \quad & \sum_{i=1}^N w_i = 1, \quad w_i \ge 0 \quad (\mathbf{w} \in \Delta_N)
+\end{align}
+
+To solve this, we utilize the Frank-Wolfe algorithm (Algorithm \ref{alg:fw}), originally proposed by \citet{ref_fw_orig}, which avoids computationally expensive projections onto the simplex. We set the number of iterations $K=500$, which provides an implicit regularization effect, preventing overfitting to the training window compared to unconstrained least squares.
+
+\begin{algorithm}[H]
+\caption{Frank-Wolfe for Ensemble Weights Optimization}
+\label{alg:fw}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Initial weights $\mathbf{w}^{(0)} \in \Delta_N$, tolerance $\epsilon$
+\FOR{$k = 0 \dots K$}
+    \STATE Compute gradient $\nabla f(\mathbf{w}^{(k)})$
+    \STATE \textit{Linear Minimization Oracle (LMO):}
+    \STATE $\mathbf{s}^{(k)} \leftarrow \arg\min_{\mathbf{s} \in \Delta_N} \langle \mathbf{s}, \nabla f(\mathbf{w}^{(k)}) \rangle$
+    \STATE Calculate step size $\gamma \leftarrow \frac{2}{k+2}$
+    \STATE Update: $\mathbf{w}^{(k+1)} \leftarrow (1-\gamma)\mathbf{w}^{(k)} + \gamma \mathbf{s}^{(k)}$
+\ENDFOR
+\STATE \textbf{Output:} Optimized weights $\mathbf{w}^{(K)}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Benchmark Ensemble Strategies}
+To rigorously evaluate the performance of the Frank-Wolfe optimization, we compare it against several established ensemble techniques:
+
+\begin{itemize}
+    \item \textbf{Ensemble Selection} \citep{ref_caruana}: This is a "greedy" optimization algorithm. Instead of analytically solving a complex equation, it iteratively constructs the ensemble. Starting with an empty set, in each iteration, it adds the single model from the pool that maximizes the performance (minimizes MSE) of the current ensemble. This process is repeated for a fixed number of iterations (20 in our study). The final weight of a model is calculated as the ratio of times it was selected to the total number of iterations. This method is highly robust against overfitting as it inherently limits extreme weights.
+    \item \textbf{NNLS (Non-Negative Least Squares):} This method solves the standard least squares problem subject to the constraint $w_i \ge 0$. In the context of energy consumption forecasting, negative weights are physically uninterpretable (implying a model subtracts consumption). NNLS enforces this constraint but often tends to yield sparse solutions, selecting only a few dominant models and assigning zero weights to the rest.
+    \item \textbf{Contextual Bandits (LinUCB):} We frame the model selection as a problem from the domain of Reinforcement Learning. An "agent" observes the current context (weather, day of week, season) and decides which model to trust (or how to mix weights) to maximize the "reward" (defined as the negative prediction error). We utilize the LinUCB (Linear Upper Confidence Bound) algorithm, which balances exploitation (choosing the model that performed well in similar contexts previously) and exploration (trying new models to reduce uncertainty).
+    \item \textbf{Simple Ensemble Average:} This serves as the baseline benchmark. It assigns equal weights ($w_i = 1/15$) to all 15 base models, representing a static averaging strategy without dynamic adaptation.
+\end{itemize}
+
+\subsection{Historical Data Weighting Schemes}
+The "memory" of the ensemble and its ability to adapt to new trends is determined by how historical data within the rolling window contributes to the weight optimization. We evaluate three distinct strategies:
+
+\begin{enumerate}
+    \item \textbf{Standard (Rolling Window):} A fixed window of $H$ weeks is used. Every observation (day) within this window is assigned equal importance (weight = 1) for the optimization task.
+    \item \textbf{Recency-Weighted Heuristic:} This is our proposed specific modification. A window of $H$ weeks is used, but data from the \textbf{most recent week} (last 7 days) are artificially emphasized. In our implementation, rows corresponding to the last week are duplicated and added twice to the training set for the optimization step. This effectively gives the most recent week $3\times$ the weight of the rest of the history, forcing the Frank-Wolfe algorithm to adapt to the immediate trend.
+    \item \textbf{Exponential Decay:} A mathematically formal approach to prioritize recent data. Each historical observation is assigned a weight $w_t = \alpha^{T-t}$, where $T$ is the current time and $t$ is the observation time. For instance, yesterday has a weight of 1.0, the day before 0.95, etc. We included this method to challenge our "Recency-Weighted" heuristic and determine if a formal decay function provides superior results to the simple duplication heuristic.
+\end{enumerate}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Results}
+
+The proposed methodology was evaluated on an out-of-sample test set covering the transition from late autumn to winter.
+
+\subsection{Base Model Performance}
+The performance of individual models varied significantly (Table \ref{tab:base_models}). The Temporal Fusion Transformer (TFT) emerged as the best single predictor with a Mean Absolute Percentage Error (MAPE) of 5.21\%, demonstrating the superiority of attention mechanisms. Tree-based models (CatBoost, XGBoost, LightGBM) followed with MAPE around 7.0-7.4\%. Statistical models, particularly Prophet (MAPE 13.15\%), underperformed significantly, likely due to their inability to rapidly adapt to the high volatility and specific holiday patterns of the Czech market.
+
+\begin{table}[H]
+\caption{Performance of Individual Base Learners (Sorted by MAPE)}
+\label{tab:base_models}
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Model} & \textbf{MAE (MWh)} & \textbf{RMSE (MWh)} & \textbf{MAPE (\%)} \\
+\midrule
+Temporal Fusion Transformer (TFT) & 9,905 & 13,046 & \textbf{5.21} \\
+CatBoost & 13,537 & 18,228 & 7.01 \\
+XGBoost & 13,200 & 17,631 & 7.16 \\
+Support Vector Regression (SVR) & 13,309 & 17,525 & 7.28 \\
+LightGBM & 13,560 & 18,073 & 7.41 \\
+N-HiTS & 13,809 & 17,991 & 7.51 \\
+ExtraTrees & 15,091 & 19,434 & 8.31 \\
+ARX (Robust) & 14,946 & 18,659 & 9.17 \\
+Bayesian Ridge & 14,852 & 18,451 & 9.18 \\
+ElasticNet & 17,071 & 20,510 & 10.67 \\
+NeuralProphet & 17,963 & 22,245 & 11.74 \\
+KNN & 21,115 & 26,519 & 12.37 \\
+LSTM & 21,293 & 26,591 & 12.91 \\
+SARIMAX & 18,840 & 25,071 & 13.05 \\
+Prophet & 19,161 & 24,113 & 13.15 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A visual comparison of the predictions from base model groups against the actual consumption is presented in Figure \ref{fig:base_models_grouped}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{report_base_models_grouped.png}
+\caption{Comparison of base learner predictions grouped by model family (Tree Models, Deep Learning, Statistical, Classical ML) against actual consumption. Deep learning models exhibit the tightest fit to the ground truth.}
+\label{fig:base_models_grouped}
+\end{figure}
+
+\subsection{Ensemble Optimization Results}
+The application of dynamic weighting strategies yielded substantial improvements. Table \ref{tab:ensemble_results} summarizes the performance of different optimization strategies using a 10-week history window, which proved to be optimal in our extended analysis (testing 3--12 weeks).
+
+\begin{table}[H]
+\caption{Comparison of Optimal Ensemble Strategies (10-Week Window)}
+\label{tab:ensemble_results}
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Strategy} & \textbf{MAE} & \textbf{RMSE} & \textbf{MAPE (\%)} \\
+\midrule
+\textbf{Ensemble Selection (10 weeks, Exponential)} & \textbf{8,260} & \textbf{10,934} & \textbf{4.43} \\
+Ensemble Selection (10 weeks, Weighted) & 8,232 & 10,892 & 4.44 \\
+Frank-Wolfe (10 weeks, Weighted) & 8,223 & 10,891 & 4.45 \\
+Frank-Wolfe (10 weeks, Exponential) & 8,333 & 11,019 & 4.48 \\
+NNLS (10 weeks, Weighted) & 9,141 & 12,053 & 5.07 \\
+\midrule
+\textit{Benchmarks:} & & & \\
+Best Single Model (TFT) & 9,905 & 13,046 & 5.21 \\
+Contextual Bandit (Online) & 9,967 & 13,089 & 5.23 \\
+Simple Ensemble Average & 11,920 & 15,044 & 6.90 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{enumerate}
+    \item \textbf{Superiority of Optimization:} The optimized ensemble achieved a MAPE of \textbf{4.43\%}, reducing the error by nearly 15\% relative to the best single model (TFT) and by 35\% relative to static averaging.
+    \item \textbf{The "Sweet Spot" of Memory:} Our extended analysis identified that a 10-week lookback window provides the optimal balance. Stability increases up to 10 weeks before data drift begins to degrade performance. This sensitivity analysis is visualized in Figure \ref{fig:sensitivity}.
+    \item \textbf{Validation of "Recency-Weighted" Heuristic:} We explicitly compared our proposed "Recency-Weighted" strategy (duplicating the most recent week) against a standard exponential decay. The Weighted approach (4.44\%) performed comparably to Exponential (4.43\%), validating the simple heuristic as a robust choice.
+    \item \textbf{Method Comparison:} Frank-Wolfe and Ensemble Selection consistently outperformed NNLS (5.07\%). The iterative nature of Frank-Wolfe ($K=500$) acts as an effective regularization against overfitting.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\textwidth]{sensitivity_analysis.png}
+\caption{Sensitivity Analysis: Effect of Rolling Window Length on Forecast Accuracy (MAPE) using the Frank-Wolfe optimization. The analysis reveals a robust "sweet spot" around 10 weeks, balancing model stability with adaptability to recent trends.}
+\label{fig:sensitivity}
+\end{figure}
+
+Figure \ref{fig:weights} illustrates the evolution of weights for the winning strategy. The system dynamically reallocates weights, effectively "hedging" against the failure of any single predictor.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{weights_evolution_frank_wolfe_10_weeks_weighted.png}
+\caption{Evolution of model weights over the test period using the Frank-Wolfe optimization (10-week weighted window). The meta-learner actively adapts to changing market conditions by shifting weights between TFT, N-HiTS, and Gradient Boosting models.}
+\label{fig:weights}
+\end{figure}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Discussion}
+
+The results confirm that the application of operations research methods to the weighting of machine learning predictions offers a transparent and controllable way to improve forecast accuracy. The 10-week weighted window appears to be a robust heuristic for the Czech gas market. The slight superiority of Ensemble Selection and Frank-Wolfe over NNLS suggests that preventing overfitting to the calibration set is crucial. Furthermore, deep learning models like TFT proved essential, but their combination with simpler tree-based models via convex optimization yielded the best operational results.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Conclusions}
+
+We presented a technical framework for optimizing gas consumption forecasts. By rigorously formulating the weighting problem and solving it via the Frank-Wolfe algorithm, we provide a scalable solution for daily energy operations. Our experiments show that this approach can reduce forecasting error (MAPE) to \textbf{4.43\%}, significantly outperforming both traditional statistical baselines and individual deep learning models. We also validated that a simple data duplication heuristic for recent observations is nearly as effective as complex exponential weighing schemes.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\vspace{6pt} 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\authorcontributions{Conceptualization, J.J. and V.V.; methodology, V.V.; software, V.V.; validation, J.J. and V.V.; formal analysis, V.V.; writing---original draft preparation, V.V.; writing---review and editing, J.J. All authors have read and agreed to the published version of the manuscript.}
+
+\funding{The author gratefully acknowledges support from the Internal Grant Agency, Faculty of Informatics and Statistics, Prague University of Economics and Business (Project No. F4/10/2024).}
+
+%\institutionalreview{Not applicable.}
+
+%\informedconsent{Not applicable.}
+
+\dataavailability{Publicly available datasets were analyzed in this study. The data can be found at \url{https://www.ote-cr.cz/} and \url{https://open-meteo.com/en/docs/historical-weather-api}.} 
+
+\acknowledgments{We thank the anonymous referees for their time and comments.}
+
+\conflictsofinterest{The authors declare no conflict of interest.} 
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{adjustwidth}{-\extralength}{0cm}
+\reftitle{References}
+\isAPAStyle{}{%
+\begin{thebibliography}{999}
+
+\bibitem[\protect\citeauthoryear{Boyd and Vandenberghe}{{2004}}]{ref_boyd}
+Boyd, S., \& Vandenberghe, L. (2004). \textit{Convex Optimization}. Cambridge University Press.
+
+\bibitem[\protect\citeauthoryear{Caruana et al.}{{2004}}]{ref_caruana}
+Caruana, R., Niculescu-Mizil, A., Crew, G., \& Ksikes, A. (2004). Ensemble selection from libraries of models. In \textit{Proceedings of the 21st International Conference on Machine Learning} (p. 18). ACM.
+
+\bibitem[\protect\citeauthoryear{Challu et al.}{{2023}}]{ref_nhits}
+Challu, C., Olivares, K. G., Oreshkin, B. N., Ramirez, F. G., Canseco, M. M., \& Dubrawski, A. (2023). N-HiTS: Neural Hierarchical Interpolation for Time Series Forecasting. \textit{Proceedings of the AAAI Conference on Artificial Intelligence}, 37, 6989--6997.
+
+\bibitem[\protect\citeauthoryear{Chen and Guestrin}{{2016}}]{ref_xgboost}
+Chen, T., \& Guestrin, C. (2016). XGBoost: A Scalable Tree Boosting System. In \textit{Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining} (pp. 785--794). ACM.
+
+\bibitem[\protect\citeauthoryear{Frank and Wolfe}{{1956}}]{ref_fw_orig}
+Frank, M., \& Wolfe, P. (1956). An algorithm for quadratic programming. \textit{Naval Research Logistics Quarterly}, 3(1-2), 95--110.
+
+\bibitem[\protect\citeauthoryear{Jaggi}{{2013}}]{ref_fw_jaggi}
+Jaggi, M. (2013). Revisiting Frank-Wolfe: Projection-Free Sparse Convex Optimization. In \textit{Proceedings of the 30th International Conference on Machine Learning} (pp. 427--435). PMLR.
+
+\bibitem[\protect\citeauthoryear{Ke et al.}{{2017}}]{ref_lgbm}
+Ke, G., Meng, Q., Finley, T., Wang, T., Chen, W., Ma, W., Ye, Q., \& Liu, T.-Y. (2017). LightGBM: A Highly Efficient Gradient Boosting Decision Tree. \textit{Advances in Neural Information Processing Systems}, 30.
+
+\bibitem[\protect\citeauthoryear{Lim et al.}{{2021}}]{ref_tft}
+Lim, B., Arik, S. O., Loeff, N., \& Pfister, T. (2021). Temporal Fusion Transformers for Interpretable Multi-horizon Time Series Forecasting. \textit{International Journal of Forecasting}, 37(4), 1748--1764.
+
+\bibitem[\protect\citeauthoryear{OTE}{{2025}}]{ref_ote}
+OTE, a.s. (2025). \textit{Metodika teplotního přepočtu TDD pro rok 2023}. Available online: \url{https://www.ote-cr.cz/} (accessed on 12 December 2025).
+
+\bibitem[\protect\citeauthoryear{Paszke et al.}{{2019}}]{ref_pytorch}
+Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J., Chanan, G., Killeen, T., Lin, Z., Gimelshein, N., Antiga, L., et al. (2019). PyTorch: An Imperative Style, High-Performance Deep Learning Library. \textit{Advances in Neural Information Processing Systems}, 32.
+
+\bibitem[\protect\citeauthoryear{Pedregosa et al.}{{2011}}]{ref_scikit}
+Pedregosa, F., Varoquaux, G., Gramfort, A., Michel, V., Thirion, B., Grisel, O., Blondel, M., Prettenhofer, P., Weiss, R., Dubourg, V., et al. (2011). Scikit-learn: Machine Learning in Python. \textit{Journal of Machine Learning Research}, 12, 2825--2830.
+
+\bibitem[\protect\citeauthoryear{Prokhorenkova et al.}{{2018}}]{ref_catboost}
+Prokhorenkova, L., Gusev, G., Vorobev, A., Dorogush, A. V., \& Gulin, A. (2018). CatBoost: Unbiased Boosting with Categorical Features. \textit{Advances in Neural Information Processing Systems}, 31.
+
+\bibitem[\protect\citeauthoryear{Taylor and Letham}{{2018}}]{ref_prophet}
+Taylor, S. J., \& Letham, B. (2018). Forecasting at Scale. \textit{The American Statistician}, 72(1), 37--45.
+
+\bibitem[\protect\citeauthoryear{Zippenfenig}{{2023}}]{ref_openmeteo}
+Zippenfenig, P. (2023). Open-Meteo.com Weather API [Computer software]. Zenodo. \url{https://doi.org/10.5281/ZENODO.7970649}
+
+\end{thebibliography}
+}
+\PublishersNote{}
+\end{adjustwidth}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\end{document}

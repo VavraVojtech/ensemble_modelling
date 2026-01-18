@@ -80,8 +80,9 @@ CONFIG = {
     'split_val_date': '2024-10-01',   
     'target_col': 'spotreba_cr',
     'seed': 42,
-    'hyperopt_evals': 100,             
-    'tft_epochs': 100
+    'hyperopt_evals': 50,             
+    'tft_epochs': 50,
+    'fw_iterations': 500 # Explicitní parametr pro Frank-Wolfe
 }
 
 # Vytvoření složek
@@ -447,8 +448,9 @@ def run_contextual_bandits_rolling(full_preds_df, test_start_date, model_cols, t
     try:
         weeks = int(strategy.split('_')[0])
         weighted = 'weighted' in strategy
+        exponential = 'exponential' in strategy # NOVÉ
     except:
-        weeks = 4; weighted = False
+        weeks = 4; weighted = False; exponential = False
         
     df = full_preds_df.sort_values('date').reset_index(drop=True)
     test_indices = df[df['date'] >= test_start_date].index
@@ -464,11 +466,21 @@ def run_contextual_bandits_rolling(full_preds_df, test_start_date, model_cols, t
         win_start = data_avail_until - timedelta(weeks=weeks)
         mask = (df['date'] >= win_start) & (df['date'] <= data_avail_until)
         hist_df = df.loc[mask].copy()
+        
+        # Logika pro váhy (u banditů to ovlivňuje "relevance" historie pro update)
+        # Poznámka: U standardního LinUCB se váhy historie obvykle nepoužívají přímo,
+        # ale můžeme je simulovat vícenásobným updatem nebo váženou regresí (zde zjednodušeno).
+        # Pro čistotu experimentu necháme bandity bez explicitního weighted/exponential,
+        # nebo bychom museli implementovat Weighted Linear Bandits.
+        # Zde ponecháme původní 'weighted' logiku (duplikace dat).
+        
         if weighted:
             w_start = data_avail_until - timedelta(days=6)
             w_df = hist_df.loc[hist_df['date'] >= w_start]
             hist_df = pd.concat([hist_df, w_df, w_df], axis=0)
-        if len(hist_df) < 5: hist_df = df.loc[df['date'] <= data_avail_until]
+            
+        # Exponential se u banditů v této implementaci obtížně aplikuje bez změny třídy.
+        # Takže pro bandity necháme jen weighted/standard.
         
         bandit = ContextualBanditEnsemble(n_models, n_features, alpha=0.2)
         X_ctx = np.c_[hist_df[features_cols].values.astype(float), np.ones(len(hist_df))]
@@ -482,82 +494,169 @@ def run_contextual_bandits_rolling(full_preds_df, test_start_date, model_cols, t
         ensemble_preds.append(df.loc[idx, model_cols[chosen]])
     return np.array(ensemble_preds)
 
-def solve_weights(X, y, method='frank_wolfe'):
+# --- NOVÁ FUNKCE PRO EXPONENCIÁLNÍ VÁHY ---
+def calculate_sample_weights(n_samples, strategy='standard'):
+    if strategy == 'exponential':
+        # Vzorec: w_t = alpha^(T-t), kde alpha < 1
+        # Chceme, aby nejstarší vzorek měl malou váhu, nejnovější váhu 1.
+        # Např. half-life = n_samples / 2
+        alpha = 0.95 # Můžeme ladit, nebo nechat fixní
+        weights = np.array([alpha**(n_samples - t - 1) for t in range(n_samples)])
+        return weights
+    elif strategy == 'weighted':
+        # Toto se řeší duplikací dat vně této funkce, takže zde vrátíme 1
+        return np.ones(n_samples)
+    else:
+        return np.ones(n_samples)
+
+def solve_weights(X, y, method='frank_wolfe', sample_weight=None):
     n_samples, n_models = X.shape
+    if sample_weight is None:
+        sample_weight = np.ones(n_samples)
+    
+    # Normalizace vah, aby součet byl n_samples (pro zachování měřítka gradientu)
+    sample_weight = sample_weight / np.mean(sample_weight)
+    
     if method == 'frank_wolfe':
         w = np.ones(n_models) / n_models
-        for k in range(500):
-            resid = np.dot(X, w) - y; grad = (2/n_samples) * np.dot(X.T, resid)
-            s = np.zeros(n_models); s[np.argmin(grad)] = 1.0
-            gamma = 2.0 / (k + 2.0); w = (1 - gamma) * w + gamma * s
+        K = CONFIG['fw_iterations'] # Použití explicitního parametru
+        for k in range(K):
+            # Gradient weighted MSE:
+            # L = sum w_i * (y_i - pred_i)^2
+            # dL/dw = 2 * X.T * (diag(w_i) * (Xw - y))
+            resid = np.dot(X, w) - y
+            weighted_resid = resid * sample_weight
+            grad = (2/n_samples) * np.dot(X.T, weighted_resid)
+            
+            s = np.zeros(n_models)
+            s[np.argmin(grad)] = 1.0
+            gamma = 2.0 / (k + 2.0)
+            w = (1 - gamma) * w + gamma * s
         return w
     elif method == 'nnls':
-        w, _ = nnls(X, y); 
+        # NNLS v scipy nepodporuje váhy přímo.
+        # Trik: Vynásobit X a y odmocninou z vah.
+        sqrt_w = np.sqrt(sample_weight)[:, np.newaxis]
+        X_w = X * sqrt_w
+        y_w = y * np.sqrt(sample_weight)
+        
+        w, _ = nnls(X_w, y_w)
         return w / np.sum(w) if np.sum(w) > 0 else np.ones(n_models) / n_models
     elif method == 'ensemble_selection':
+        # U Ensemble Selection se váhy používají v metriky chyby
         pool = []
-        best_single = np.argmin([mean_squared_error(y, X[:, i]) for i in range(n_models)])
-        pool.append(best_single); curr_pred = X[:, best_single]
+        # Počáteční výběr podle vážené chyby
+        best_single = np.argmin([np.average((y - X[:, i])**2, weights=sample_weight) for i in range(n_models)])
+        pool.append(best_single)
+        curr_pred = X[:, best_single]
+        
         for _ in range(20): 
             best_idx, best_err = -1, float('inf')
             for i in range(n_models):
                 tmp = (curr_pred * len(pool) + X[:, i]) / (len(pool) + 1)
-                err = mean_squared_error(y, tmp)
+                err = np.average((y - tmp)**2, weights=sample_weight)
                 if err < best_err: best_err = err; best_idx = i
-            pool.append(best_idx); curr_pred = (curr_pred * (len(pool)-1) + X[:, best_idx]) / len(pool)
-        w = np.zeros(n_models); 
+            pool.append(best_idx)
+            curr_pred = (curr_pred * (len(pool)-1) + X[:, best_idx]) / len(pool)
+        w = np.zeros(n_models)
         for idx in pool: w[idx] += 1
         return w / np.sum(w)
     return np.ones(n_models) / n_models
 
 def get_rolling_weights(full_preds_df, test_start_date, model_cols, target_col='Actual', strategy='4_weeks', method='frank_wolfe'):
+    # Parse strategy string
     try:
-        weeks = int(strategy.split('_')[0])
-        weighted = 'weighted' in strategy
+        parts = strategy.split('_')
+        weeks = int(parts[0])
+        mode = parts[2] if len(parts) > 2 else 'standard' # 'weighted', 'exponential', 'standard'
     except:
-        weeks = 4; weighted = False
+        weeks = 4; mode = 'standard'
+        
     df = full_preds_df.sort_values('date').reset_index(drop=True)
     test_indices = df[df['date'] >= test_start_date].index
     preds = []
+    
     for idx in test_indices:
         target_date = df.loc[idx, 'date']
         data_avail_until = target_date - timedelta(days=2)
         win_start = data_avail_until - timedelta(weeks=weeks)
         mask = (df['date'] >= win_start) & (df['date'] <= data_avail_until)
         hist_df = df.loc[mask].copy()
-        if weighted:
+        
+        # PŘÍPRAVA DAT A VAH
+        X_h = hist_df[model_cols].values
+        y_h = hist_df[target_col].values
+        
+        if mode == 'weighted':
+            # Stará metoda: Duplikace dat
             w_start = data_avail_until - timedelta(days=6)
-            w_df = hist_df.loc[hist_df['date'] >= w_start]
-            hist_df = pd.concat([hist_df, w_df, w_df], axis=0)
-        if len(hist_df) < 5: hist_df = df.loc[df['date'] <= data_avail_until]
-        X_h = hist_df[model_cols].values; y_h = hist_df[target_col].values
-        w_opt = solve_weights(X_h, y_h, method=method)
+            mask_recent = hist_df['date'] >= w_start
+            X_recent = hist_df.loc[mask_recent, model_cols].values
+            y_recent = hist_df.loc[mask_recent, target_col].values
+            # 2x navíc (celkem 3x váha)
+            X_h = np.concatenate([X_h, X_recent, X_recent], axis=0)
+            y_h = np.concatenate([y_h, y_recent, y_recent], axis=0)
+            sample_weight = np.ones(len(y_h)) # Už je to "váženo" duplikací
+            
+        elif mode == 'exponential':
+            # Nová metoda: Sample weights
+            sample_weight = calculate_sample_weights(len(y_h), strategy='exponential')
+            
+        else:
+            sample_weight = np.ones(len(y_h))
+            
+        if len(hist_df) < 5: 
+            # Fallback pro velmi krátká okna
+            w_opt = np.ones(len(model_cols)) / len(model_cols)
+        else:
+            w_opt = solve_weights(X_h, y_h, method=method, sample_weight=sample_weight)
+            
         preds.append(np.dot(df.loc[idx, model_cols].values, w_opt))
     return np.array(preds)
 
 def plot_weights_evolution(full_preds_df, test_start_date, model_cols, target_col='Actual', folder='output_graphs', method='frank_wolfe', strategy='4_weeks'):
+    # Zjednodušená verze pro plot - používá stejnou logiku jako get_rolling_weights
+    # Ale jen pro jednu strategii
     try:
-        weeks = int(strategy.split('_')[0])
-        weighted = 'weighted' in strategy
+        parts = strategy.split('_')
+        weeks = int(parts[0])
+        mode = parts[2] if len(parts) > 2 else 'standard'
     except:
-        weeks = 4; weighted = False
+        weeks = 4; mode = 'standard'
+
     df = full_preds_df.sort_values('date').reset_index(drop=True)
     test_indices = df[df['date'] >= test_start_date].index
     weights_history = []; dates = []
+    
     for idx in test_indices:
         target_date = df.loc[idx, 'date']
         data_avail_until = target_date - timedelta(days=2)
         win_start = data_avail_until - timedelta(weeks=weeks)
         mask = (df['date'] >= win_start) & (df['date'] <= data_avail_until)
         hist_df = df.loc[mask].copy()
-        if weighted:
+        
+        X_h = hist_df[model_cols].values
+        y_h = hist_df[target_col].values
+        
+        if mode == 'weighted':
             w_start = data_avail_until - timedelta(days=6)
-            w_df = hist_df.loc[hist_df['date'] >= w_start]
-            hist_df = pd.concat([hist_df, w_df, w_df], axis=0)
-        if len(hist_df) < 5: hist_df = df.loc[df['date'] <= data_avail_until]
-        X_h = hist_df[model_cols].values; y_h = hist_df[target_col].values
-        w_opt = solve_weights(X_h, y_h, method=method)
-        weights_history.append(w_opt); dates.append(target_date)
+            mask_recent = hist_df['date'] >= w_start
+            X_recent = hist_df.loc[mask_recent, model_cols].values
+            y_recent = hist_df.loc[mask_recent, target_col].values
+            X_h = np.concatenate([X_h, X_recent, X_recent], axis=0)
+            y_h = np.concatenate([y_h, y_recent, y_recent], axis=0)
+            sample_weight = np.ones(len(y_h))
+        elif mode == 'exponential':
+            sample_weight = calculate_sample_weights(len(y_h), strategy='exponential')
+        else:
+            sample_weight = np.ones(len(y_h))
+            
+        if len(hist_df) > 5:
+            w_opt = solve_weights(X_h, y_h, method=method, sample_weight=sample_weight)
+            weights_history.append(w_opt); dates.append(target_date)
+            
+    if not weights_history: return
+
     weights_df = pd.DataFrame(weights_history, columns=model_cols, index=dates)
     plt.figure(figsize=(18, 9))
     plt.stackplot(weights_df.index, weights_df.T, labels=weights_df.columns, alpha=0.85)
@@ -565,7 +664,6 @@ def plot_weights_evolution(full_preds_df, test_start_date, model_cols, target_co
     plt.title(f'Weights Evolution ({method} | {strategy})', fontsize=16)
     plt.ylabel('Weight', fontsize=12); plt.xlabel('Date', fontsize=12)
     plt.margins(0, 0); plt.tight_layout()
-    # Ukládáme do podsložky weights_plots
     filename = f"weights_evolution_{method}_{strategy}.png"
     plt.savefig(os.path.join(folder, "weights_plots", filename), dpi=300); plt.close()
     
@@ -590,7 +688,6 @@ def generate_report(test_df, cols, title, folder, filename):
     df_m = pd.DataFrame(metrics).sort_values('RMSE')
     print(f"\n--- {title} ---")
     print(df_m)
-    # Ukládáme do podsložky ensemble_reports
     df_m.to_latex(os.path.join(folder, "ensemble_reports", f"{filename}.tex"), index=False, float_format="%.2f")
     
     plt.figure(figsize=(14, 7))
@@ -702,11 +799,13 @@ def main():
     test_res['Ensemble_Avg'] = test_res[model_cols].mean(axis=1)
     
     methods = ['frank_wolfe', 'nnls', 'ensemble_selection']
-    # UPDATED: 3-13 weeks
-    windows_base = [f"{i}_weeks" for i in range(3, 13)]
+    # Rozšířená sada oken pro experiment
+    windows_base = [f"{i}_weeks" for i in range(3, 12)]
     windows = []
     for w in windows_base:
-        windows.append(w); windows.append(f"{w}_weighted")
+        windows.append(w)
+        windows.append(f"{w}_weighted")
+        windows.append(f"{w}_exponential") # PŘIDÁNO: Exponenciální váhy
         
     test_res['Bandit_Online'] = run_contextual_bandits_online(full_preds, test_start, model_cols, target_col='Actual')
     
@@ -714,10 +813,11 @@ def main():
         print(f"Processing window: {w}...")
         for method in methods:
             test_res[f"{method}_{w}"] = get_rolling_weights(full_preds, test_start, model_cols, strategy=w, method=method)
-            # Plot weights for each combo
             plot_weights_evolution(full_preds, test_start, model_cols, target_col='Actual', folder=CONFIG['output_graphs'], method=method, strategy=w)
             
-        test_res[f"Bandit_{w}"] = run_contextual_bandits_rolling(full_preds, test_start, model_cols, target_col='Actual', strategy=w)
+        # Bandits pouze pro základní okna (neumí weighted/exponential přímo)
+        if 'weighted' not in w and 'exponential' not in w:
+            test_res[f"Bandit_{w}"] = run_contextual_bandits_rolling(full_preds, test_start, model_cols, target_col='Actual', strategy=w)
 
     out_dir = CONFIG['output_graphs']
     generate_grouped_report(test_res, model_cols, out_dir)
